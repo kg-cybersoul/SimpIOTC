@@ -1,0 +1,61 @@
+[package]
+name = "iot-compressor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["kg-cybersoul"]
+description = "High-speed, high-ratio LZ77/ANS compressor for Sensor & IoT time-series data"
+license = "MIT"
+repository = "https://github.com/kg-cybersoul/SimpIOTC"
+homepage = "https://github.com/kg-cybersoul/SimpIOTC"
+readme = "README.md"
+keywords = ["compression", "iot", "time-series", "lz77", "ans"]
+categories = ["compression", "embedded", "science"]
+
+[lib]
+name = "iot_compressor"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[[bin]]
+name = "iotc"
+path = "src/main.rs"
+
+[[bench]]
+name = "compression"
+harness = false
+
+[features]
+default = ["parallel"]
+parallel = ["rayon"]
+ffi = []
+python = ["pyo3/extension-module"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+sha2 = "0.10"
+thiserror = "2"
+byteorder = "1.5"
+crc32fast = "1.4"
+pyo3 = { version = "0.23", optional = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+tempfile = "3"
+lz4_flex = "0.13"
+zstd = "0.13"
+pco = "1.0"
+tsz = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true

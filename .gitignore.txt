@@ -1,0 +1,11 @@
+/target
+/demo/target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.d
