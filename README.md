@@ -6,7 +6,7 @@ A high-speed LZ77/ANS compression engine in Rust, purpose-built for sensor and I
 
 On structured data, stride transposition + domain-aware preprocessing achieves ratios that generic byte-level compressors cannot reach. On general-purpose data (Silesia corpus), the LZ77+FSE engine is still competitive with zstd (3.23x vs 3.19x).
 
-Ships with **C/C++ bindings** for embedded targets, **Python bindings** for data workflows, and a **schema bridge** for direct Arrow/Polars DataFrame ingest.
+Ships with **C/C++ bindings** for systems integration (Linux/RTOS IoT devices, ground stations), **Python bindings** for data workflows, and a **schema bridge** for direct Arrow/Polars DataFrame ingest.
 
 ## Key Numbers
 
@@ -112,10 +112,10 @@ use iot_compressor::{
     CompressionConfig, DataType,
 };
 
-// Compress
+// Compress 12-byte structs: { u32 timestamp, f32 temp, f32 humidity }
 let config = CompressionConfig {
-    data_type: Some(DataType::IntegerI64),
-    stride: Some(12),
+    data_type: Some(DataType::Raw),  // Raw — let stride handle struct layout
+    stride: Some(12),                // 12 bytes per record
     ..CompressionConfig::balanced()
 };
 let compressed = compress(&data, &config)?;
@@ -130,12 +130,12 @@ let range = reader.decompress_byte_range(1000, 2000)?;
 
 // Schema-based column extraction (Arrow/Polars bridge)
 let schema = Schema::new(vec![
-    ("timestamp".into(), ColumnType::I64),
-    ("temperature".into(), ColumnType::F64),
+    ("timestamp".into(), ColumnType::U32),
+    ("temperature".into(), ColumnType::F32),
     ("humidity".into(), ColumnType::F32),
 ]);
 let columns = reader.extract_all_columns(&schema)?;
-// columns[0].data → contiguous i64 bytes, zero-copy into Arrow/Polars
+// columns[0].data → contiguous u32 bytes, zero-copy into Arrow/Polars
 ```
 
 ### Configuration Presets
@@ -216,11 +216,12 @@ if (rc != IOTC_OK) {
     printf("Error: %.*s\n", (int)iotc_last_error_len(), iotc_last_error());
 }
 
-// Random access on ground station
+// Random access on ground station — blocks default to 2 MiB
 IotcSeekableReader* reader = iotc_seekable_open(compressed, compressed_len);
-uint8_t block_buf[4096];
-int64_t block_len = iotc_seekable_decompress_block(reader, 50, block_buf, sizeof(block_buf));
+uint8_t* block_buf = malloc(2 * 1024 * 1024);
+int64_t block_len = iotc_seekable_decompress_block(reader, 50, block_buf, 2 * 1024 * 1024);
 iotc_seekable_close(reader);
+free(block_buf);
 
 // Free allocated buffers
 iotc_free(compressed, compressed_len);

@@ -444,6 +444,14 @@ impl FrameFlags {
 
     /// Deserialize flags from a u16.
     pub fn from_u16(bits: u16) -> Result<Self> {
+        // Reject unknown high bits — a future format version would set these,
+        // and silently ignoring them risks misinterpreting the frame.
+        if bits & 0xF800 != 0 {
+            return Err(CompressorError::CorruptedBlock {
+                offset: 0,
+                detail: format!("unknown flags in high bits: 0x{:04X}", bits & 0xF800),
+            });
+        }
         let dt = match bits & 0x0F {
             0 => DataType::Raw,
             1 => DataType::IntegerI64,
@@ -795,6 +803,30 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn frame_flags_rejects_unknown_high_bits() {
+        // Valid flags with bit 11 set — should be rejected
+        let valid_base = FrameFlags {
+            data_type: DataType::Raw,
+            parser_mode: ParserMode::Greedy,
+            has_content_checksum: false,
+            has_repcodes: false,
+            has_seek_table: false,
+        };
+        let bits = valid_base.to_u16();
+        assert!(FrameFlags::from_u16(bits).is_ok());
+
+        // Set each reserved bit (11-15) and verify rejection
+        for bit in 11..=15 {
+            let bad_bits = bits | (1 << bit);
+            assert!(
+                FrameFlags::from_u16(bad_bits).is_err(),
+                "bit {} should be rejected",
+                bit
+            );
         }
     }
 
