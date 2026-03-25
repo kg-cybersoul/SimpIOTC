@@ -59,9 +59,10 @@ pub fn estimated_ratio(data: &[u8]) -> f64 {
 }
 
 /// Estimate entropy on a prefix of the data (for speed on large inputs).
-/// Uses at most `max_sample` bytes. If data is shorter, uses all of it.
+/// Uses at most `max_sample` bytes. If data is shorter or `max_sample` is 0,
+/// uses all of it.
 pub fn entropy_bits_per_byte_sampled(data: &[u8], max_sample: usize) -> f64 {
-    let sample = if data.len() > max_sample {
+    let sample = if max_sample > 0 && data.len() > max_sample {
         &data[..max_sample]
     } else {
         data
@@ -128,6 +129,17 @@ mod tests {
             (r - 2.0).abs() < 0.1,
             "expected ~2.0x ratio for 16-symbol data, got {r}"
         );
+    }
+
+    #[test]
+    fn sampled_zero_limit_uses_full_data() {
+        // max_sample=0 must fall back to full-data entropy, not return 0.0
+        // from an empty slice. A false 0.0 would signal "perfectly compressible"
+        // and corrupt adaptive preprocessing decisions.
+        let data: Vec<u8> = (0..256 * 100).map(|i| (i % 256) as u8).collect();
+        let full = entropy_bits_per_byte(&data);
+        let sampled = entropy_bits_per_byte_sampled(&data, 0);
+        assert_eq!(full, sampled, "max_sample=0 should fall back to full data");
     }
 
     #[test]
