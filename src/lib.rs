@@ -477,6 +477,8 @@ pub struct FrameFlags {
 }
 
 impl FrameFlags {
+    pub const CONTENT_CHECKSUM_BIT: u16 = 1 << 8;
+
     /// Serialize flags into a single u16 for the wire format.
     pub fn to_u16(&self) -> u16 {
         let dt: u16 = match self.data_type {
@@ -995,6 +997,63 @@ mod tests {
         assert_eq!(bytes.len(), FrameHeader::SERIALIZED_SIZE);
         let decoded = FrameHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header, decoded);
+    }
+    #[test]
+    fn frame_header_v1_rejects_polar_quant_flag_bit() {
+        let mut bytes = FrameHeader {
+            version: 1,
+            flags: FrameFlags {
+                data_type: DataType::Raw,
+                parser_mode: ParserMode::Greedy,
+                has_content_checksum: false,
+                has_repcodes: true,
+                has_seek_table: false,
+                has_polar_quant_params: false,
+            },
+            block_size: 1024,
+            original_size: 0,
+            block_count: 0,
+            stride: 0,
+        }
+        .to_bytes();
+
+        let mut bits = u16::from_le_bytes([bytes[5], bytes[6]]);
+        bits |= 1 << 11;
+        bytes[5..7].copy_from_slice(&bits.to_le_bytes());
+
+        assert!(matches!(
+            FrameHeader::from_bytes(&bytes),
+            Err(CompressorError::CorruptedBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn frame_header_v1_rejects_polar_quant_data_type_flags() {
+        let mut bytes = FrameHeader {
+            version: 1,
+            flags: FrameFlags {
+                data_type: DataType::Raw,
+                parser_mode: ParserMode::Greedy,
+                has_content_checksum: false,
+                has_repcodes: true,
+                has_seek_table: false,
+                has_polar_quant_params: false,
+            },
+            block_size: 1024,
+            original_size: 0,
+            block_count: 0,
+            stride: 0,
+        }
+        .to_bytes();
+
+        let mut bits = u16::from_le_bytes([bytes[5], bytes[6]]);
+        bits = (bits & !0x000F) | 11;
+        bytes[5..7].copy_from_slice(&bits.to_le_bytes());
+
+        assert!(matches!(
+            FrameHeader::from_bytes(&bytes),
+            Err(CompressorError::CorruptedBlock { .. })
+        ));
     }
 
     #[test]

@@ -382,7 +382,7 @@ pub fn compress(data: &[u8], config: &CompressionConfig) -> Result<Vec<u8>> {
         if config.lossy.is_some() {
             let mut trial = output.clone();
             let mut bits = u16::from_le_bytes([trial[5], trial[6]]);
-            bits &= !(1 << 8);
+            bits &= !FrameFlags::CONTENT_CHECKSUM_BIT;
             trial[5..7].copy_from_slice(&bits.to_le_bytes());
             let reconstructed = decompress(&trial)?;
             hasher.update(&reconstructed);
@@ -446,14 +446,12 @@ fn decode_polar_quant_block(
     let codes_bytes = (vector_count * dim * pq_cfg.bits_per_coord as usize).div_ceil(8);
     let codes_stride = (pq_cfg.vector_dim as usize * pq_cfg.bits_per_coord as usize) / 8;
 
-    let mut crc = CrcHasher::new();
-    crc.update(codes_payload);
     let codes_block = BlockHeader {
         compressed_size: codes_payload.len() as u32,
         original_size: codes_bytes as u32,
-        crc32: crc.finalize(),
+        crc32: 0,
     };
-    ws.polar_quant.codes = decode_block_payload(
+    ws.polar_quant.codes = decode_block_payload_unchecked(
         codes_payload,
         &codes_block,
         DataType::Raw,
@@ -462,24 +460,26 @@ fn decode_polar_quant_block(
         ws,
     )?;
 
-    let mut crc = CrcHasher::new();
-    crc.update(means_payload);
     let means_block = BlockHeader {
         compressed_size: means_payload.len() as u32,
         original_size: aux_bytes as u32,
-        crc32: crc.finalize(),
+        crc32: 0,
     };
-    ws.polar_quant.means =
-        decode_block_payload(means_payload, &means_block, DataType::Float32, 0, None, ws)?;
+    ws.polar_quant.means = decode_block_payload_unchecked(
+        means_payload,
+        &means_block,
+        DataType::Float32,
+        0,
+        None,
+        ws,
+    )?;
 
-    let mut crc = CrcHasher::new();
-    crc.update(scales_payload);
     let scales_block = BlockHeader {
         compressed_size: scales_payload.len() as u32,
         original_size: aux_bytes as u32,
-        crc32: crc.finalize(),
+        crc32: 0,
     };
-    ws.polar_quant.scales = decode_block_payload(
+    ws.polar_quant.scales = decode_block_payload_unchecked(
         scales_payload,
         &scales_block,
         DataType::Float32,
@@ -488,9 +488,9 @@ fn decode_polar_quant_block(
         ws,
     )?;
 
-    let codes = ws.polar_quant.codes.clone();
-    let means = ws.polar_quant.means.clone();
-    let scales = ws.polar_quant.scales.clone();
+    let codes = std::mem::take(&mut ws.polar_quant.codes);
+    let means = std::mem::take(&mut ws.polar_quant.means);
+    let scales = std::mem::take(&mut ws.polar_quant.scales);
     let enc_ref = polar_quant::PolarQuantEncodedRef {
         codes: &codes,
         means: &means,
@@ -508,6 +508,10 @@ fn decode_polar_quant_block(
         }
         _ => unreachable!("decode_polar_quant_block called for non-polar type"),
     }
+
+    ws.polar_quant.codes = codes;
+    ws.polar_quant.means = means;
+    ws.polar_quant.scales = scales;
 
     if out.len() != bh.original_size as usize {
         return Err(CompressorError::CorruptedBlock {
@@ -534,15 +538,40 @@ pub(crate) fn decode_block_payload(
     polar_params: Option<PolarQuantParams>,
     ws: &mut DecodeWorkspace,
 ) -> Result<Vec<u8>> {
-    // Verify CRC32
-    let mut hasher = CrcHasher::new();
-    hasher.update(payload);
-    let actual_crc32 = hasher.finalize();
-    if actual_crc32 != bh.crc32 {
-        return Err(CompressorError::ChecksumMismatch {
-            expected: bh.crc32,
-            computed: actual_crc32,
-        });
+    decode_block_payload_inner(payload, bh, data_type, stride_val, polar_params, ws, true)
+}
+
+fn decode_block_payload_unchecked(
+    payload: &[u8],
+    bh: &BlockHeader,
+    data_type: DataType,
+    stride_val: usize,
+    polar_params: Option<PolarQuantParams>,
+    ws: &mut DecodeWorkspace,
+) -> Result<Vec<u8>> {
+    decode_block_payload_inner(payload, bh, data_type, stride_val, polar_params, ws, false)
+}
+
+fn decode_block_payload_inner(
+    payload: &[u8],
+    bh: &BlockHeader,
+    data_type: DataType,
+    stride_val: usize,
+    polar_params: Option<PolarQuantParams>,
+    ws: &mut DecodeWorkspace,
+    verify_crc: bool,
+) -> Result<Vec<u8>> {
+    if verify_crc {
+        // Verify CRC32
+        let mut hasher = CrcHasher::new();
+        hasher.update(payload);
+        let actual_crc32 = hasher.finalize();
+        if actual_crc32 != bh.crc32 {
+            return Err(CompressorError::ChecksumMismatch {
+                expected: bh.crc32,
+                computed: actual_crc32,
+            });
+        }
     }
 
     if data_type.uses_polar_quant() {

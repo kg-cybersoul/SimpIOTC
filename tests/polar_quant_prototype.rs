@@ -66,8 +66,66 @@ fn hd3_roundtrip_many_vectors() {
     }
 }
 
+fn max_kurtosis(rotated: &[f64], dim: usize, samples: usize) -> f64 {
+    let mut max_kurtosis = 0.0f64;
+    for c in 0..dim {
+        let mut sum = 0.0;
+        for s in 0..samples {
+            sum += rotated[s * dim + c];
+        }
+        let mean = sum / samples as f64;
+
+        let mut m2 = 0.0;
+        let mut m4 = 0.0;
+        for s in 0..samples {
+            let d = rotated[s * dim + c] - mean;
+            let d2 = d * d;
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        let var = m2 / samples as f64;
+        if var > 0.0 {
+            let kurtosis = (m4 / samples as f64) / (var * var);
+            max_kurtosis = max_kurtosis.max(kurtosis);
+        }
+    }
+    max_kurtosis
+}
+
 #[test]
 fn hd3_gaussianization_kurtosis() {
+    let dim = POLAR_QUANT_DEFAULT_DIM as usize;
+    let samples = 10_000usize;
+    let hd3 = Hd3::from_seed(0xDEADBEEF, dim);
+    let mut rng = StdRng::seed_from_u64(4242);
+    let mut rotated = vec![0.0f64; dim * samples];
+    let mut v = vec![0.0f64; dim];
+
+    // Approximate Gaussian inputs using CLT (sum of uniforms).
+    for s in 0..samples {
+        for x in &mut v {
+            let mut g = 0.0;
+            for _ in 0..12 {
+                g += rng.gen_range(-0.5..0.5);
+            }
+            *x = g;
+        }
+
+        let mean = v.iter().copied().sum::<f64>() / dim as f64;
+        for x in &mut v {
+            *x -= mean;
+        }
+
+        hd3.apply(&mut v);
+        rotated[s * dim..(s + 1) * dim].copy_from_slice(&v);
+    }
+
+    let max_k = max_kurtosis(&rotated, dim, samples);
+    assert!(max_k <= 3.5, "max kurtosis: {}", max_k);
+}
+
+#[test]
+fn hd3_gaussianization_kurtosis_structured_waveforms() {
     let dim = POLAR_QUANT_DEFAULT_DIM as usize;
     let samples = 10_000usize;
     let hd3 = Hd3::from_seed(0xDEADBEEF, dim);
@@ -98,34 +156,9 @@ fn hd3_gaussianization_kurtosis() {
         rotated[s * dim..(s + 1) * dim].copy_from_slice(&v);
     }
 
-    let mut max_kurtosis = 0.0f64;
-    for c in 0..dim {
-        let mut sum = 0.0;
-        for s in 0..samples {
-            sum += rotated[s * dim + c];
-        }
-        let mean = sum / samples as f64;
-
-        let mut m2 = 0.0;
-        let mut m4 = 0.0;
-        for s in 0..samples {
-            let d = rotated[s * dim + c] - mean;
-            let d2 = d * d;
-            m2 += d2;
-            m4 += d2 * d2;
-        }
-        let var = m2 / samples as f64;
-        if var > 0.0 {
-            let kurtosis = (m4 / samples as f64) / (var * var);
-            max_kurtosis = max_kurtosis.max(kurtosis);
-        }
-    }
-
-    // Structured synthetic waveforms produce heavier tails than idealized
-    // Gaussian assumptions; keep this as a sanity bound rather than a strict gate.
-    assert!(max_kurtosis <= 4.8, "max kurtosis: {}", max_kurtosis);
+    let max_k = max_kurtosis(&rotated, dim, samples);
+    assert!(max_k <= 4.8, "max kurtosis: {}", max_k);
 }
-
 #[test]
 fn quantization_rmse_matches_closed_form() {
     let dim = POLAR_QUANT_DEFAULT_DIM as usize;
