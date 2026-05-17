@@ -430,6 +430,108 @@ fn generate_struct_array_24(n: usize) -> Vec<u8> {
     data
 }
 
+fn bench_polar_quant(c: &mut Criterion) {
+    fn polar_quant_config(data_type: DataType, bits_per_coord: u8) -> CompressionConfig {
+        let mut cfg = CompressionConfig::lossy(bits_per_coord);
+        cfg.parser_mode = ParserMode::Lazy;
+        cfg.data_type = Some(data_type);
+        cfg.block_size = 2 * 1024 * 1024;
+        cfg.store_checksum = false;
+        cfg
+    }
+
+    const TEN_MB: usize = 10 * 1024 * 1024;
+    let temp_data = generate_temperatures(TEN_MB / 8);
+    let vib_data = generate_vibration(TEN_MB / 4);
+
+    // 1) f64 temperature, k=8
+    let cfg_f64_k8 = polar_quant_config(DataType::Float64PolarQuant, 8);
+    let compressed_f64_k8 = compress(&temp_data, &cfg_f64_k8).unwrap();
+    let roundtrip_f64_k8 = decompress(&compressed_f64_k8).unwrap();
+    assert_eq!(roundtrip_f64_k8.len(), temp_data.len());
+
+    let mut group = c.benchmark_group("polar_quant_f64_temperature_k8");
+    group.throughput(Throughput::Bytes(temp_data.len() as u64));
+    group.sample_size(10);
+    group.bench_function("compress", |b| {
+        b.iter(|| compress(black_box(&temp_data), &cfg_f64_k8))
+    });
+    group.bench_function("decompress", |b| {
+        b.iter(|| decompress(black_box(&compressed_f64_k8)))
+    });
+    group.finish();
+
+    // 2) f64 temperature, k=4
+    let cfg_f64_k4 = polar_quant_config(DataType::Float64PolarQuant, 4);
+    let compressed_f64_k4 = compress(&temp_data, &cfg_f64_k4).unwrap();
+    let roundtrip_f64_k4 = decompress(&compressed_f64_k4).unwrap();
+    assert_eq!(roundtrip_f64_k4.len(), temp_data.len());
+
+    let mut group = c.benchmark_group("polar_quant_f64_temperature_k4");
+    group.throughput(Throughput::Bytes(temp_data.len() as u64));
+    group.sample_size(10);
+    group.bench_function("compress", |b| {
+        b.iter(|| compress(black_box(&temp_data), &cfg_f64_k4))
+    });
+    group.bench_function("decompress", |b| {
+        b.iter(|| decompress(black_box(&compressed_f64_k4)))
+    });
+    group.finish();
+
+    // 3) f32 vibration, k=8
+    let cfg_f32_k8 = polar_quant_config(DataType::Float32PolarQuant, 8);
+    let compressed_f32_k8 = compress(&vib_data, &cfg_f32_k8).unwrap();
+    let roundtrip_f32_k8 = decompress(&compressed_f32_k8).unwrap();
+    assert_eq!(roundtrip_f32_k8.len(), vib_data.len());
+
+    let mut group = c.benchmark_group("polar_quant_f32_vibration_k8");
+    group.throughput(Throughput::Bytes(vib_data.len() as u64));
+    group.sample_size(10);
+    group.bench_function("compress", |b| {
+        b.iter(|| compress(black_box(&vib_data), &cfg_f32_k8))
+    });
+    group.bench_function("decompress", |b| {
+        b.iter(|| decompress(black_box(&compressed_f32_k8)))
+    });
+    group.finish();
+
+    // 4) PolarQuant vs current lossless f64 baseline
+    let cfg_lossless_f64 = CompressionConfig {
+        parser_mode: ParserMode::Lazy,
+        data_type: Some(DataType::Float64ShuffleDelta),
+        block_size: 2 * 1024 * 1024,
+        store_checksum: false,
+        ..Default::default()
+    };
+    let compressed_lossless = compress(&temp_data, &cfg_lossless_f64).unwrap();
+
+    eprintln!(
+        "polar_quant_vs_lossless_f64: raw={}B, pq_k8={}B ({:.2}x), lossless_sd={}B ({:.2}x)",
+        temp_data.len(),
+        compressed_f64_k8.len(),
+        temp_data.len() as f64 / compressed_f64_k8.len() as f64,
+        compressed_lossless.len(),
+        temp_data.len() as f64 / compressed_lossless.len() as f64
+    );
+
+    let mut group = c.benchmark_group("polar_quant_vs_lossless_f64");
+    group.throughput(Throughput::Bytes(temp_data.len() as u64));
+    group.sample_size(10);
+    group.bench_function("compress_polar_k8", |b| {
+        b.iter(|| compress(black_box(&temp_data), &cfg_f64_k8))
+    });
+    group.bench_function("compress_lossless_shuffle_delta", |b| {
+        b.iter(|| compress(black_box(&temp_data), &cfg_lossless_f64))
+    });
+    group.bench_function("decompress_polar_k8", |b| {
+        b.iter(|| decompress(black_box(&compressed_f64_k8)))
+    });
+    group.bench_function("decompress_lossless_shuffle_delta", |b| {
+        b.iter(|| decompress(black_box(&compressed_lossless)))
+    });
+    group.finish();
+}
+
 fn bench_stride_transpose(c: &mut Criterion) {
     use iot_compressor::preprocessor::{bitshuffle, stride as stride_mod};
 
@@ -1338,6 +1440,7 @@ criterion_group!(
     bench_entropy,
     bench_compress,
     bench_decompress,
+    bench_polar_quant,
     bench_stride_transpose,
     bench_compress_stride,
     bench_decompress_stride,

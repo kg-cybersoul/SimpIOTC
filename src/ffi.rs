@@ -664,6 +664,8 @@ fn data_type_from_u8(v: u8) -> Option<Option<DataType>> {
         9 => Some(Some(DataType::Float64Shuffle)),
         10 => Some(Some(DataType::Float32ShuffleDelta)),
         11 => Some(Some(DataType::Float64ShuffleDelta)),
+        12 => Some(Some(DataType::Float32PolarQuant)),
+        13 => Some(Some(DataType::Float64PolarQuant)),
         _ => None, // unknown
     }
 }

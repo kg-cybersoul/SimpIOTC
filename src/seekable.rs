@@ -9,7 +9,7 @@
 use crate::parallel::decode_block_payload;
 use crate::schema::{NamedColumn, Schema};
 use crate::workspace::DecodeWorkspace;
-use crate::{BlockHeader, CompressorError, FrameHeader, Result, SeekTable};
+use crate::{BlockHeader, CompressorError, FrameHeader, PolarQuantParams, Result, SeekTable};
 
 /// A reader that provides O(1) random access to compressed blocks via the seek table.
 ///
@@ -18,6 +18,7 @@ use crate::{BlockHeader, CompressorError, FrameHeader, Result, SeekTable};
 pub struct SeekableReader<'a> {
     data: &'a [u8],
     header: FrameHeader,
+    polar_params: Option<PolarQuantParams>,
     seek_table: SeekTable,
     workspace: DecodeWorkspace,
 }
@@ -43,8 +44,28 @@ impl<'a> SeekableReader<'a> {
             });
         }
 
+        let mut st_start = FrameHeader::SERIALIZED_SIZE;
+        let mut polar_params = None;
+        if header.flags.has_polar_quant_params {
+            if st_start + PolarQuantParams::SERIALIZED_SIZE > data.len() {
+                return Err(CompressorError::BufferUnderflow {
+                    needed: PolarQuantParams::SERIALIZED_SIZE,
+                    available: data.len() - st_start,
+                });
+            }
+            polar_params = Some(PolarQuantParams::from_bytes(
+                &data[st_start..st_start + PolarQuantParams::SERIALIZED_SIZE],
+            )?);
+            st_start += PolarQuantParams::SERIALIZED_SIZE;
+        }
+
+        if header.flags.data_type.uses_polar_quant() && polar_params.is_none() {
+            return Err(CompressorError::InvalidPolarQuantConfig(
+                "polar-quant data_type requires PolarQuantParams".into(),
+            ));
+        }
+
         let st_size = SeekTable::serialized_size(header.block_count);
-        let st_start = FrameHeader::SERIALIZED_SIZE;
         if st_start + st_size > data.len() {
             return Err(CompressorError::BufferUnderflow {
                 needed: st_size,
@@ -58,6 +79,7 @@ impl<'a> SeekableReader<'a> {
         Ok(Self {
             data,
             header,
+            polar_params,
             seek_table,
             workspace: DecodeWorkspace::new(),
         })
@@ -109,7 +131,14 @@ impl<'a> SeekableReader<'a> {
         let payload = &self.data[payload_start..payload_start + bh.compressed_size as usize];
         let data_type = self.header.flags.data_type;
         let stride_val = self.header.stride as usize;
-        decode_block_payload(payload, &bh, data_type, stride_val, &mut self.workspace)
+        decode_block_payload(
+            payload,
+            &bh,
+            data_type,
+            stride_val,
+            self.polar_params,
+            &mut self.workspace,
+        )
     }
 
     /// Decompress a contiguous range of blocks `[start, end)`.

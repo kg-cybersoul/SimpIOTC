@@ -15,12 +15,12 @@ import iotc
 
 compressed = iotc.compress(my_data)         # squish it
 original   = iotc.decompress(compressed)    # unsquish it
-assert original == my_data                  # lossless, always
+assert original == my_data                  # lossless path
 ```
 
 That's it. Everything below is about making it compress **better** and **faster**.
 
-## The Three Knobs That Actually Matter
+## The Four Knobs That Actually Matter
 
 ### 1. Data Type (`data_type`)
 
@@ -32,8 +32,9 @@ Tells the compressor what kind of numbers your data contains so it can pick the 
 | Timestamps (epoch millis, counters) | `"i64"` or `"u64"` | Delta-of-delta: turns `[1000, 1001, 1002]` into `[0, 0, 0]` |
 | 32-bit IDs, sequence numbers | `"i32"` or `"u32"` | Same delta trick, 32-bit |
 | Any floats (temperature, vibration, GPS) | `"auto"` | Auto-detect picks the best float strategy per block |
+| High-ratio lossy float compression | `"f64pq"` / `"f32pq"` | PolarQuant (mean-center + HD3 + quantize) |
 
-**If you only remember one thing:** for integers, explicitly set the data type. For floats, `auto` is fine — it selects the best strategy (Gorilla XOR, byte shuffle, or shuffle+delta) per block via entropy estimation.
+**If you only remember one thing:** for integers, explicitly set the data type. For floats, `auto` is fine for lossless mode. Lossy mode is never auto-selected and must be explicit.
 
 ```python
 # Timestamps — always specify explicitly
@@ -41,6 +42,9 @@ compressed = iotc.compress(ts_bytes, data_type="i64")
 
 # Floats — auto handles it
 compressed = iotc.compress(temp_bytes)  # auto picks shuffle+delta for smooth, shuffle for noisy
+
+# High-ratio lossy floats
+compressed_lossy = iotc.compress_lossy(temp_bytes, 8, data_type="f64pq")
 ```
 
 ### 2. Stride (`stride`)
@@ -78,6 +82,25 @@ compressed = iotc.compress(data, parser="greedy")
 # Best ratio — for storage
 compressed = iotc.compress(data, parser="optimal")
 ```
+
+### 4. Lossy PolarQuant (`compress_lossy`)
+
+For float data where ratio matters more than bit-exact reconstruction.
+
+```python
+compressed = iotc.compress_lossy(
+    data,
+    8,                  # bits per coordinate (2..8)
+    data_type="f64pq",  # or "f32pq"
+    dim=256,            # power of 2
+    seed=0xC0FFEE_FEEDFACE,
+)
+```
+
+Rules:
+- Only works with `f64pq` / `f32pq`
+- Incompatible with stride mode
+- Lower bits give higher ratio and more error
 
 ## Column Extraction — The Arrow/Polars Bridge
 
@@ -135,6 +158,21 @@ columns = reader.extract_columns(
 | `parser` | `str` | `"lazy"` | `"greedy"`, `"lazy"`, or `"optimal"` |
 | `threads` | `int` | `0` | Thread count, 0 = auto (all cores) |
 | `block_size` | `int` | `2097152` | Block size in bytes (2 MiB default) |
+| `checksum` | `bool` | `True` | SHA-256 integrity check |
+| `seek_table` | `bool` | `True` | Enables random access |
+
+### `iotc.compress_lossy(data, bits, **kwargs) -> bytes`
+
+| Parameter | Type | Default | What it does |
+|-----------|------|---------|-------------|
+| `data` | `bytes` | required | Raw input bytes |
+| `bits` | `int` | required | Quantization bits per coordinate (`2..8`) |
+| `data_type` | `str` | `"f64pq"` | Must be `"f64pq"` or `"f32pq"` |
+| `dim` | `int` | `256` | Vector dimension (power of 2) |
+| `seed` | `int or None` | `None` | HD3 sign seed (`None` uses default) |
+| `parser` | `str` | `"lazy"` | `"greedy"`, `"lazy"`, or `"optimal"` |
+| `threads` | `int` | `0` | Thread count, 0 = auto |
+| `block_size` | `int` | `2097152` | Block size in bytes |
 | `checksum` | `bool` | `True` | SHA-256 integrity check |
 | `seek_table` | `bool` | `True` | Enables random access |
 
@@ -202,7 +240,9 @@ iotc_free(out, out_len);
 iotc_free(dec, dec_len);
 ```
 
-**Data type constants:** `IOTC_TYPE_AUTO` (0), `IOTC_TYPE_RAW` (1), `IOTC_TYPE_I32` (2), `IOTC_TYPE_I64` (3), `IOTC_TYPE_F32` (4), `IOTC_TYPE_F64` (5), `IOTC_TYPE_U32` (6), `IOTC_TYPE_U64` (7), `IOTC_TYPE_F32S` (8), `IOTC_TYPE_F64S` (9)
+**Data type constants:** `IOTC_TYPE_AUTO` (0), `IOTC_TYPE_RAW` (1), `IOTC_TYPE_I32` (2), `IOTC_TYPE_I64` (3), `IOTC_TYPE_F32` (4), `IOTC_TYPE_F64` (5), `IOTC_TYPE_U32` (6), `IOTC_TYPE_U64` (7), `IOTC_TYPE_F32S` (8), `IOTC_TYPE_F64S` (9), `IOTC_TYPE_F32SD` (10), `IOTC_TYPE_F64SD` (11)
+
+The C API currently exposes only lossless compression options. PolarQuant lossy configuration is currently available from CLI and Python.
 
 **Error pattern:** every function returns `IOTC_OK` (0) or a negative code. Call `iotc_last_error()` for the human-readable message.
 
@@ -247,6 +287,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for full GIS benchmark results.
 - Is your data structured? Set `stride` to the struct size.
 - Is your trajectory data sorted by entity? Unsorted spatial data loses to zstd. See the GPS section above.
 - Are you compressing tiny inputs? The 25-byte frame header + 12-byte block header is fixed overhead. Below ~100 bytes, the output can be larger than the input.
+- For lossy mode, did you call `compress_lossy(...)` with `f64pq`/`f32pq`? `compress(...)` stays lossless.
 
 **"Decompression fails"**
 - The compressed data is a self-contained frame. You can't split it arbitrarily — you need the complete frame (header + all blocks + optional trailer).

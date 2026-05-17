@@ -484,6 +484,7 @@ dependencies = [
  "pco",
  "pyo3",
  "rand",
+ "rand_chacha",
  "rayon",
  "sha2",
  "tempfile",

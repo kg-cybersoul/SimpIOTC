@@ -1,6 +1,6 @@
 # iotc — IoT Time-Series Compressor
 
-**483x on timestamps. 4.7x on real GPS trajectories. 1.4 GiB/s decompress.**
+**483x on timestamps. 4.7x on real GPS trajectories. Up to 41.78x on smooth f64 with lossy PolarQuant.**
 
 A high-speed LZ77/ANS compression engine in Rust, purpose-built for sensor and IoT time-series data. On integer sequences (timestamps, counters, monotonic IDs), iotc is not an incremental improvement over general-purpose compressors — it is **categorically different**: 483x vs zstd's 2.5x vs LZ4's 1.3x.
 
@@ -12,13 +12,11 @@ Ships with **C/C++ bindings** for systems integration (Linux/RTOS IoT devices, g
 
 | Metric | Integer Data | Float Data | General (Silesia) |
 |--------|-------------|------------|-------------------|
-| Compression ratio | **483x** (timestamps) | 1.3x (shuffle+delta) | 3.23x |
-| Compress throughput | 55 MiB/s | 23-30 MiB/s | 22-125 MiB/s |
-| Decompress throughput | **1.4 GiB/s** | 147-278 MiB/s | 413 MiB/s - 1.1 GiB/s |
-| vs zstd -3 ratio | **190x better** | 1.2x better | 1.01x better |
-| vs LZ4 ratio | **371x better** | 1.15x better | 1.54x better |
+| Compression ratio | **483x** (timestamps) | **1.34x lossless** (`f64sd`), **9.54x lossy** (`f64pq k=8`), **41.78x** (`k=4`) | 3.23x |
+| Compress throughput | 55 MiB/s | 23-30 MiB/s (lossless), 56-151 MiB/s (lossy PQ) | 22-125 MiB/s |
+| Decompress throughput | **1.4 GiB/s** | 147-278 MiB/s (lossless), 135-307 MiB/s (lossy PQ) | 413 MiB/s - 1.1 GiB/s |
 
-Decompress throughput on integer data (1.4 GiB/s) saturates DDR4 memory bandwidth. Float decompress is slower (147-278 MiB/s) due to the un-shuffle + un-delta pipeline.
+Decompress throughput on integer data (1.4 GiB/s) saturates DDR4 memory bandwidth. Lossless float decompress remains slower due to the un-shuffle + un-delta pipeline; lossy PolarQuant adds a separate high-ratio path with explicit error tradeoffs.
 
 **Real-world GPS validation**: 33M+ points across T-Drive, GeoLife, and NOAA AIS datasets — **4.5-4.7x** with fixed-point encoding vs zstd's 2.1-2.9x. See [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -34,7 +32,7 @@ Raw IoT Data
          |
          v
 +-----------------+
-|  Preprocessor   |  Delta-of-delta (integers), Gorilla XOR, or shuffle+delta (floats)
+|  Preprocessor   |  Delta-of-delta (integers), Gorilla XOR / shuffle+delta (lossless floats), or PolarQuant (lossy floats)
 +--------+--------+
          |
          v
@@ -59,10 +57,10 @@ Raw IoT Data
          |
          v
    Compressed Frame
-   [Header | SeekTable | Blocks | SHA-256]
+   [Header | PolarQuantParams? | SeekTable | Blocks | SHA-256]
 ```
 
-Each block is independently compressed. Per-block CRC32, optional whole-frame SHA-256, and optional seek table for O(1) random block access.
+Each block is independently compressed. Per-block CRC32, optional whole-frame SHA-256, optional seek table for O(1) random block access, and optional frame-level PolarQuant parameters for lossy float mode.
 
 ## Feature Flags
 
@@ -94,6 +92,12 @@ iotc -t i64 -p optimal sensor_log.bin compressed.iotc
 
 # Structured data: 12-byte records (u32 + f32 + f32)
 iotc --stride 12 sensor_log.bin compressed.iotc
+
+# Lossy float mode (PolarQuant), 8 bits per coordinate
+iotc -t f64pq --lossy-bits 8 sensor_f64.bin compressed.iotc
+
+# Higher-ratio lossy mode with lower precision
+iotc -t f64pq --lossy-bits 4 --lossy-dim 256 sensor_f64.bin compressed_k4.iotc
 
 # Decompress
 iotc -d compressed.iotc restored.bin
@@ -166,6 +170,10 @@ for i in range(10000):
 
 compressed = iotc.compress(data, data_type="raw", stride=12)
 assert iotc.decompress(compressed) == data
+
+# Optional lossy float mode (note: output is not bit-exact)
+temps = b"".join(struct.pack("<f", 20.0 + (i % 256) * 0.01) for i in range(1024))
+lossy = iotc.compress_lossy(temps, 8, data_type="f32pq")
 
 # O(1) random access — jump to any block without decompressing the whole file
 reader = iotc.SeekableReader(compressed)
@@ -244,8 +252,22 @@ See `include/iotc.h` for the full API reference.
 | `Float32Shuffle` | `f32s` | Byte shuffle | Noisy f32 sensors |
 | `Float64ShuffleDelta` | `f64sd` | Byte shuffle + byte delta | Smooth f64 (best auto-detect choice) |
 | `Float32ShuffleDelta` | `f32sd` | Byte shuffle + byte delta | Smooth f32 (best auto-detect choice) |
+| `Float64PolarQuant` | `f64pq` | Mean-center + HD3 rotate + scalar quantize | High-ratio lossy f64 |
+| `Float32PolarQuant` | `f32pq` | Mean-center + HD3 rotate + scalar quantize | High-ratio lossy f32 |
 
-Auto-detect selects the best strategy per block via Shannon entropy estimation. In most cases, `auto` picks the right transform — explicit type hints give marginal improvement.
+Auto-detect selects only lossless strategies (`raw`, integer delta, Gorilla, shuffle, shuffle+delta). It does not auto-enable lossy PolarQuant. Lossy mode must be requested explicitly.
+
+## Lossy PolarQuant
+
+PolarQuant is an opt-in lossy mode for float data:
+
+- CLI flags: `--lossy-bits`, `--lossy-dim`, `--lossy-seed`
+- Data types: `f64pq` / `f32pq`
+- Bits range: `2..=8` (practical default: `8`)
+- Vector dimension must be a power of two (default `256`)
+- Not compatible with `--stride` in the same frame
+
+Use this mode when compression ratio is more important than bit-exact reconstruction.
 
 ## Stride Transposition
 
@@ -260,12 +282,18 @@ Example: a 12-byte struct `{u32 timestamp, f32 temp, f32 humidity}` with `--stri
 ```
 [FrameHeader - 25 bytes]
   magic:          4 bytes  "IOTC"
-  version:        1 byte
-  flags:          2 bytes  (data type, parser mode, checksum, repcodes, seek_table)
+  version:        1 byte   (current: 2, also reads v1)
+  flags:          2 bytes  (data type, parser mode, checksum, repcodes, seek_table, polar_params)
   block_size:     4 bytes
   original_size:  8 bytes
   block_count:    4 bytes
   stride:         2 bytes  (0 = no transposition)
+
+[PolarQuantParams - 12 bytes, optional]
+  vector_dim:     2 bytes
+  bits_per_coord: 1 byte
+  reserved:       1 byte
+  seed:           8 bytes
 
 [SeekTable - 8*N+4 bytes, optional]
   entries:        8 bytes x block_count  (absolute byte offsets)
@@ -273,7 +301,9 @@ Example: a 12-byte struct `{u32 timestamp, f32 temp, f32 humidity}` with `--stri
 
 [Block 0]
   BlockHeader:   12 bytes  (compressed_size, original_size, crc32)
-  Payload:       variable  (FSE-encoded LZ77 tokens)
+  Payload:       variable
+    - lossless types: FSE-encoded LZ77 tokens
+    - polar-quant types: [codes_size u32][means_size u32][codes][means][scales]
 
 [Block 1]
   ...
@@ -316,6 +346,7 @@ src/
     gorilla_xor.rs        Gorilla XOR float encoding
     bitshuffle.rs         Byte-level shuffle (L1-cache tiled)
     stride.rs             Struct transposition (AoS -> SoA)
+    polar_quant.rs        Lossy HD3 rotation + scalar quantization
   match_finder/
     mod.rs                MatchFinder API, Pareto frontier
     hash_chain.rs         Hash table + circular prev buffer
@@ -339,7 +370,7 @@ benches/
   compression.rs          Criterion benchmarks
 ```
 
-~18,000 lines of Rust. 439 tests.
+~18,000 lines of Rust. 449 core unit tests + 6 PolarQuant prototype tests.
 
 ## Dependencies
 

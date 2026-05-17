@@ -11,6 +11,8 @@ All benchmarks on Windows 11, AMD Ryzen 7 5700X, 32 GB DDR4, Rust 1.93.0. Native
 | GPS trajectories (fixed-point, 25M pts) | **4.5x** | 2.1x | 1.5x | 2.1x vs zstd |
 | Telemetry structs (stride=12) | **22x** | 1.6x | 1.2x | 14x vs zstd |
 | Temperature f64 (shuffle+delta) | **1.34x** | 1.1x | 1.0x | 1.2x vs zstd |
+| Temperature f64 (PolarQuant k=8, lossy) | **9.54x** | 1.1x | 1.0x | 8.7x vs zstd |
+| Temperature f64 (PolarQuant k=4, lossy) | **41.78x** | 1.1x | 1.0x | 38x vs zstd |
 | General-purpose (Silesia, 202 MB) | **3.23x** | 3.19x | 2.10x | Competitive |
 
 On integer time-series, iotc is not an incremental improvement — delta-of-delta preprocessing collapses monotonic sequences to near-constant residuals before the entropy coder sees them. LZ4 and zstd do byte-level matching on raw 8-byte integers and cannot detect that the second derivative is nearly zero.
@@ -52,7 +54,7 @@ LZ4 compresses 10x faster. The question is whether iotc's CPU time buys enough r
 
 ## Float Data
 
-### Compression Ratio (100K elements)
+### Lossless Compression Ratio (100K elements)
 
 | Dataset | iotc (shuffle+delta) | iotc (Gorilla XOR) | Pcodec | zstd -3 | LZ4 |
 |---------|---------------------|-------------------|--------|---------|-----|
@@ -71,6 +73,29 @@ Gorilla XOR expands noisy f32 data (0.87x). Shuffle+delta handles both smooth an
 | Vibration f32 | 23 MiB/s | 147 MiB/s | 100 MiB/s | 877 MiB/s |
 
 Float decompression (147-278 MiB/s) is the weakest area. The un-shuffle + un-byte-delta pipeline adds latency that Pcodec's native typed decode avoids. For float-heavy workloads where decompress speed matters more than ratio, Pcodec is the better choice.
+
+---
+
+### Lossy PolarQuant (10 MiB synthetic datasets)
+
+PolarQuant is an opt-in lossy mode (`f64pq` / `f32pq`) that trades precision for ratio.
+
+#### Compression Ratio
+
+| Dataset | iotc (lossless baseline) | iotc PolarQuant |
+|---------|--------------------------|-----------------|
+| Temperature f64 | 1.36x (`f64sd`) | **9.54x** (`k=8`), **41.78x** (`k=4`) |
+| Vibration f32 | 1.57x (`f32sd`) | **4.23x** (`k=8`) |
+
+#### Throughput (Criterion)
+
+| Dataset / Mode | Compress | Decompress |
+|----------------|----------|------------|
+| Temperature f64, PQ k=8 | 99.5-113.3 MiB/s | 250.7-255.6 MiB/s |
+| Temperature f64, PQ k=4 | 144.6-150.9 MiB/s | 288.3-307.3 MiB/s |
+| Vibration f32, PQ k=8 | 56.0-57.9 MiB/s | 135.1-143.6 MiB/s |
+
+On the same 10 MiB temperature dataset, PQ `k=8` compressed faster than lossless `f64sd` (109-111 MiB/s vs 21.5-22.4 MiB/s) while producing a much smaller output.
 
 ---
 
@@ -228,6 +253,7 @@ zstd's Python throughput is higher because `pyzstd` is a thin C wrapper. iotc go
 | Bandwidth-constrained uplink | **iotc** | 174x faster end-to-end than LZ4 on 10 Mbps links |
 | GPS/trajectory (sorted, fixed-point) | **iotc** | 4.5-4.7x vs zstd's 2.1-2.9x |
 | Max compress speed | **LZ4** | 10 GiB/s, negligible memory |
+| Float archival with bounded error | **iotc PolarQuant** | 9.5x (`k=8`) to 41.8x (`k=4`) on smooth f64 |
 | Float-heavy, decompress speed critical | **Pcodec** | 8-12x faster float decompress |
 | Columnar analytics (DataFrames) | **Parquet** | Schema-aware, ecosystem integration |
 | Random / encrypted data | Don't compress | Nothing works |
@@ -243,4 +269,6 @@ zstd's Python throughput is higher because `pyzstd` is a thin C wrapper. iotc go
 
 3. **Unsorted spatial data**: Pre-sorting by entity ID is required for trajectory compression. Unsorted global feeds (raw AIS, mixed fleet) lose to zstd.
 
-4. **Python FFI overhead**: PyO3 data copy overhead is significant. For throughput-critical Python workflows, process in batches to amortize.
+4. **Lossy constraints**: PolarQuant is opt-in only, requires `f64pq`/`f32pq`, is incompatible with stride mode, and introduces bounded reconstruction error.
+
+5. **Python FFI overhead**: PyO3 data copy overhead is significant. For throughput-critical Python workflows, process in batches to amortize.

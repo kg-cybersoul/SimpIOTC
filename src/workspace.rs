@@ -218,6 +218,38 @@ impl PreprocessScratch {
     }
 }
 
+/// Scratch for PolarQuant decode.
+pub struct PolarQuantDecodeScratch {
+    /// Rotation working buffer.
+    pub working: Vec<f64>,
+    /// Decoded codes stream bytes.
+    pub codes: Vec<u8>,
+    /// Decoded means stream bytes.
+    pub means: Vec<u8>,
+    /// Decoded scales stream bytes.
+    pub scales: Vec<u8>,
+    /// Dequantized rotated coordinates before inverse HD3.
+    pub dequant_buf: Vec<f64>,
+}
+
+impl Default for PolarQuantDecodeScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolarQuantDecodeScratch {
+    pub fn new() -> Self {
+        Self {
+            working: Vec::new(),
+            codes: Vec::new(),
+            means: Vec::new(),
+            scales: Vec::new(),
+            dequant_buf: Vec::new(),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Top-Level Decode Workspace
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -234,6 +266,8 @@ pub struct DecodeWorkspace {
     pub preprocess: PreprocessScratch,
     /// Scratch buffer for stride un-transposition on decompress.
     pub stride_buf: Vec<u8>,
+    /// Scratch for PolarQuant block decode path.
+    pub polar_quant: PolarQuantDecodeScratch,
 }
 
 impl Default for DecodeWorkspace {
@@ -251,6 +285,7 @@ impl DecodeWorkspace {
             replay: ReplayScratch::new(),
             preprocess: PreprocessScratch::new(),
             stride_buf: Vec::new(),
+            polar_quant: PolarQuantDecodeScratch::new(),
         }
     }
 
@@ -261,6 +296,7 @@ impl DecodeWorkspace {
             replay: ReplayScratch::with_capacity(block_size),
             preprocess: PreprocessScratch::with_capacity(block_size),
             stride_buf: Vec::with_capacity(block_size),
+            polar_quant: PolarQuantDecodeScratch::new(),
         }
     }
 }
@@ -464,6 +500,35 @@ impl PreprocessEncodeScratch {
     }
 }
 
+/// Scratch for PolarQuant encode.
+pub struct PolarQuantEncodeScratch {
+    /// Rotation working buffer.
+    pub working: Vec<f64>,
+    /// Bit-packed coordinate codes.
+    pub codes: Vec<u8>,
+    /// Per-vector means as f32 little-endian bytes.
+    pub means: Vec<u8>,
+    /// Per-vector scales as f32 little-endian bytes.
+    pub scales: Vec<u8>,
+}
+
+impl Default for PolarQuantEncodeScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolarQuantEncodeScratch {
+    pub fn new() -> Self {
+        Self {
+            working: Vec::new(),
+            codes: Vec::new(),
+            means: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Top-Level Encode Workspace
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -479,6 +544,8 @@ pub struct EncodeWorkspace {
     pub entropy: EntropyEncodeScratch,
     /// Scratch buffer for stride transposition on compress.
     pub stride_buf: Vec<u8>,
+    /// Scratch for PolarQuant block encode path.
+    pub polar_quant: PolarQuantEncodeScratch,
 }
 
 impl Default for EncodeWorkspace {
@@ -494,6 +561,7 @@ impl EncodeWorkspace {
             parser: ParserScratch::new(),
             entropy: EntropyEncodeScratch::new(),
             stride_buf: Vec::new(),
+            polar_quant: PolarQuantEncodeScratch::new(),
         }
     }
 }

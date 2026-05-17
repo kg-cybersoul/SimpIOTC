@@ -40,6 +40,7 @@ crc32fast = "1.4"
 pyo3 = { version = "0.23", optional = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+rand_chacha = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

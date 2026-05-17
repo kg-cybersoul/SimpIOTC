@@ -9,3 +9,29 @@
 *.dylib
 *.pdb
 *.d
+.python-version
+.python-version.*
+
+# Python virtualenvs and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Profiling / coverage artifacts
+*.profraw
+*.profdata

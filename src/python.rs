@@ -13,7 +13,7 @@ use pyo3::types::{PyBytes, PyDict};
 use crate::parallel;
 use crate::schema::{ColumnType, Schema};
 use crate::seekable;
-use crate::{CompressionConfig, CompressorError, DataType, ParserMode};
+use crate::{CompressionConfig, CompressorError, DataType, LossyConfig, ParserMode};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Error Conversion
@@ -56,8 +56,10 @@ fn parse_data_type(s: &str) -> PyResult<Option<DataType>> {
         "f64s" => Ok(Some(DataType::Float64Shuffle)),
         "f32sd" => Ok(Some(DataType::Float32ShuffleDelta)),
         "f64sd" => Ok(Some(DataType::Float64ShuffleDelta)),
+        "f32pq" => Ok(Some(DataType::Float32PolarQuant)),
+        "f64pq" => Ok(Some(DataType::Float64PolarQuant)),
         _ => Err(PyValueError::new_err(format!(
-            "unknown data_type '{}': expected auto, raw, i32, u32, i64, u64, f32, f64, f32s, f64s, f32sd, f64sd", s
+            "unknown data_type '{}': expected auto, raw, i32, u32, i64, u64, f32, f64, f32s, f64s, f32sd, f64sd, f32pq, f64pq", s
         ))),
     }
 }
@@ -147,10 +149,66 @@ fn compress<'py>(
         store_seek_table: seek_table,
         window_size: base.window_size,
         max_chain_depth: base.max_chain_depth,
+        lossy: None,
     };
 
     let result = py.allow_threads(|| parallel::compress(data, &config));
 
+    match result {
+        Ok(compressed) => Ok(PyBytes::new(py, &compressed)),
+        Err(e) => Err(to_py_err(e)),
+    }
+}
+
+/// Compress data with explicit PolarQuant lossy mode.
+#[pyfunction]
+#[pyo3(signature = (data, bits, *, data_type="f64pq", dim=256, seed=None, parser="lazy", threads=0, block_size=2097152, checksum=true, seek_table=true))]
+#[allow(clippy::too_many_arguments)]
+fn compress_lossy<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    bits: u8,
+    data_type: &str,
+    dim: u16,
+    seed: Option<u64>,
+    parser: &str,
+    threads: usize,
+    block_size: usize,
+    checksum: bool,
+    seek_table: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mode = parse_parser_mode(parser)?;
+    let dt = parse_data_type(data_type)?.ok_or_else(|| {
+        PyValueError::new_err("lossy mode requires explicit data_type (f64pq/f32pq)")
+    })?;
+    match dt {
+        DataType::Float64PolarQuant | DataType::Float32PolarQuant => {}
+        _ => {
+            return Err(PyValueError::new_err(
+                "lossy mode requires data_type='f64pq' or 'f32pq'",
+            ));
+        }
+    }
+
+    let mut config = CompressionConfig {
+        parser_mode: mode,
+        data_type: Some(dt),
+        stride: None,
+        num_threads: threads,
+        block_size,
+        store_checksum: checksum,
+        store_seek_table: seek_table,
+        window_size: CompressionConfig::balanced().window_size,
+        max_chain_depth: CompressionConfig::balanced().max_chain_depth,
+        lossy: None,
+    };
+    config.lossy = Some(LossyConfig {
+        vector_dim: dim,
+        bits_per_coord: bits,
+        seed: seed.unwrap_or(crate::preprocessor::polar_quant::POLAR_QUANT_DEFAULT_SEED),
+    });
+
+    let result = py.allow_threads(|| parallel::compress(data, &config));
     match result {
         Ok(compressed) => Ok(PyBytes::new(py, &compressed)),
         Err(e) => Err(to_py_err(e)),
@@ -366,6 +424,7 @@ impl SeekableReader {
 #[pymodule]
 fn iotc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compress, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_lossy, m)?)?;
     m.add_function(wrap_pyfunction!(decompress, m)?)?;
     m.add_class::<SeekableReader>()?;
     Ok(())

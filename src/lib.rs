@@ -36,7 +36,7 @@ use thiserror::Error;
 pub const FRAME_MAGIC: [u8; 4] = [0x49, 0x4F, 0x54, 0x43];
 
 /// Current frame format version.
-pub const FRAME_VERSION: u8 = 1;
+pub const FRAME_VERSION: u8 = 2;
 
 /// Default block size for parallel compression (2 MiB).
 pub const DEFAULT_BLOCK_SIZE: usize = 2 * 1024 * 1024;
@@ -124,6 +124,18 @@ pub enum CompressorError {
 
     #[error("Invalid block size: {size} — {reason}")]
     InvalidBlockSize { size: usize, reason: &'static str },
+
+    #[error("Lossy mode requires data_type to be Float64PolarQuant or Float32PolarQuant (and vice versa)")]
+    LossyRequiresFloatType,
+
+    #[error("Invalid PolarQuant config: {0}")]
+    InvalidPolarQuantConfig(String),
+
+    #[error("PolarQuant vector_dim must be a power of 2 in [2, 4096], got {0}")]
+    PolarQuantDimNotPow2(u16),
+
+    #[error("PolarQuant bits_per_coord must be in [{min}, {max}], got {got}")]
+    PolarQuantBitsOutOfRange { got: u8, min: u8, max: u8 },
 }
 
 pub type Result<T> = std::result::Result<T, CompressorError>;
@@ -251,6 +263,12 @@ pub enum DataType {
     /// Stream of IEEE 754 single-precision floats.
     /// Byte shuffle + byte-delta composition.
     Float32ShuffleDelta,
+    /// Stream of IEEE 754 double-precision floats.
+    /// Lossy PolarQuant (HD3 rotation + scalar quantization).
+    Float64PolarQuant,
+    /// Stream of IEEE 754 single-precision floats.
+    /// Lossy PolarQuant (HD3 rotation + scalar quantization).
+    Float32PolarQuant,
 }
 
 impl DataType {
@@ -263,12 +281,14 @@ impl DataType {
             | DataType::IntegerU64
             | DataType::Float64
             | DataType::Float64Shuffle
-            | DataType::Float64ShuffleDelta => 8,
+            | DataType::Float64ShuffleDelta
+            | DataType::Float64PolarQuant => 8,
             DataType::IntegerI32
             | DataType::IntegerU32
             | DataType::Float32
             | DataType::Float32Shuffle
-            | DataType::Float32ShuffleDelta => 4,
+            | DataType::Float32ShuffleDelta
+            | DataType::Float32PolarQuant => 4,
         }
     }
 
@@ -306,6 +326,14 @@ impl DataType {
             DataType::Float64ShuffleDelta | DataType::Float32ShuffleDelta
         )
     }
+
+    /// Returns true if this type uses PolarQuant lossy preprocessing.
+    pub fn uses_polar_quant(&self) -> bool {
+        matches!(
+            self,
+            DataType::Float64PolarQuant | DataType::Float32PolarQuant
+        )
+    }
 }
 
 impl fmt::Display for DataType {
@@ -322,6 +350,26 @@ impl fmt::Display for DataType {
             DataType::Float32Shuffle => write!(f, "f32s"),
             DataType::Float64ShuffleDelta => write!(f, "f64sd"),
             DataType::Float32ShuffleDelta => write!(f, "f32sd"),
+            DataType::Float64PolarQuant => write!(f, "f64pq"),
+            DataType::Float32PolarQuant => write!(f, "f32pq"),
+        }
+    }
+}
+
+/// Lossy-mode configuration. Presence enables PolarQuant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossyConfig {
+    pub vector_dim: u16,
+    pub bits_per_coord: u8,
+    pub seed: u64,
+}
+
+impl LossyConfig {
+    pub fn new(bits_per_coord: u8) -> Self {
+        Self {
+            vector_dim: crate::preprocessor::polar_quant::POLAR_QUANT_DEFAULT_DIM,
+            bits_per_coord,
+            seed: crate::preprocessor::polar_quant::POLAR_QUANT_DEFAULT_SEED,
         }
     }
 }
@@ -351,6 +399,8 @@ pub struct CompressionConfig {
     pub stride: Option<u16>,
     /// Whether to write a seek table after the frame header for O(1) block lookup.
     pub store_seek_table: bool,
+    /// Lossy PolarQuant settings. None keeps fully lossless behavior.
+    pub lossy: Option<LossyConfig>,
 }
 
 impl Default for CompressionConfig {
@@ -365,6 +415,7 @@ impl Default for CompressionConfig {
             store_checksum: true,
             stride: None,
             store_seek_table: true,
+            lossy: None,
         }
     }
 }
@@ -392,6 +443,14 @@ impl CompressionConfig {
             ..Default::default()
         }
     }
+
+    /// Enable lossy PolarQuant compression with `bits_per_coord`.
+    pub fn lossy(bits_per_coord: u8) -> Self {
+        Self {
+            lossy: Some(LossyConfig::new(bits_per_coord)),
+            ..Self::balanced()
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -413,6 +472,8 @@ pub struct FrameFlags {
     pub has_repcodes: bool,
     /// Whether a seek table follows the frame header (before block data).
     pub has_seek_table: bool,
+    /// Whether PolarQuantParams are present after the frame header.
+    pub has_polar_quant_params: bool,
 }
 
 impl FrameFlags {
@@ -430,6 +491,8 @@ impl FrameFlags {
             DataType::Float32Shuffle => 8,
             DataType::Float64ShuffleDelta => 9,
             DataType::Float32ShuffleDelta => 10,
+            DataType::Float64PolarQuant => 11,
+            DataType::Float32PolarQuant => 12,
         };
         let pm: u16 = match self.parser_mode {
             ParserMode::Greedy => 0,
@@ -439,17 +502,18 @@ impl FrameFlags {
         let ck: u16 = if self.has_content_checksum { 1 } else { 0 };
         let rc: u16 = if self.has_repcodes { 1 } else { 0 };
         let st: u16 = if self.has_seek_table { 1 } else { 0 };
-        dt | (pm << 4) | (ck << 8) | (rc << 9) | (st << 10)
+        let pq: u16 = if self.has_polar_quant_params { 1 } else { 0 };
+        dt | (pm << 4) | (ck << 8) | (rc << 9) | (st << 10) | (pq << 11)
     }
 
     /// Deserialize flags from a u16.
     pub fn from_u16(bits: u16) -> Result<Self> {
         // Reject unknown high bits — a future format version would set these,
         // and silently ignoring them risks misinterpreting the frame.
-        if bits & 0xF800 != 0 {
+        if bits & 0xF000 != 0 {
             return Err(CompressorError::CorruptedBlock {
                 offset: 0,
-                detail: format!("unknown flags in high bits: 0x{:04X}", bits & 0xF800),
+                detail: format!("unknown flags in high bits: 0x{:04X}", bits & 0xF000),
             });
         }
         let dt = match bits & 0x0F {
@@ -464,6 +528,8 @@ impl FrameFlags {
             8 => DataType::Float32Shuffle,
             9 => DataType::Float64ShuffleDelta,
             10 => DataType::Float32ShuffleDelta,
+            11 => DataType::Float64PolarQuant,
+            12 => DataType::Float32PolarQuant,
             other => {
                 return Err(CompressorError::CorruptedBlock {
                     offset: 0,
@@ -485,12 +551,14 @@ impl FrameFlags {
         let ck = ((bits >> 8) & 1) == 1;
         let rc = ((bits >> 9) & 1) == 1;
         let st = ((bits >> 10) & 1) == 1;
+        let pq = ((bits >> 11) & 1) == 1;
         Ok(Self {
             data_type: dt,
             parser_mode: pm,
             has_content_checksum: ck,
             has_repcodes: rc,
             has_seek_table: st,
+            has_polar_quant_params: pq,
         })
     }
 }
@@ -557,6 +625,21 @@ impl FrameHeader {
             return Err(CompressorError::UnsupportedVersion(version));
         }
         let flags_bits = u16::from_le_bytes([buf[5], buf[6]]);
+        // v1 compatibility: v1 frames must not use v2-only flag/data-type space.
+        if version == 1 {
+            if ((flags_bits >> 11) & 1) == 1 {
+                return Err(CompressorError::CorruptedBlock {
+                    offset: 0,
+                    detail: "v1 frame cannot set has_polar_quant_params".into(),
+                });
+            }
+            if (flags_bits & 0x0F) > 10 {
+                return Err(CompressorError::CorruptedBlock {
+                    offset: 0,
+                    detail: "v1 frame cannot use PolarQuant data_type flags".into(),
+                });
+            }
+        }
         let flags = FrameFlags::from_u16(flags_bits)?;
         let block_size = u32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]);
         let original_size = u64::from_le_bytes([
@@ -707,6 +790,59 @@ impl SeekTable {
     }
 }
 
+/// PolarQuant frame-level parameters.
+///
+/// Present immediately after FrameHeader when `flags.has_polar_quant_params` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolarQuantParams {
+    pub vector_dim: u16,
+    pub bits_per_coord: u8,
+    pub seed: u64,
+}
+
+impl PolarQuantParams {
+    pub const SERIALIZED_SIZE: usize = 12;
+
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut out = [0u8; Self::SERIALIZED_SIZE];
+        out[0..2].copy_from_slice(&self.vector_dim.to_le_bytes());
+        out[2] = self.bits_per_coord;
+        out[3] = 0; // reserved
+        out[4..12].copy_from_slice(&self.seed.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::SERIALIZED_SIZE {
+            return Err(CompressorError::BufferUnderflow {
+                needed: Self::SERIALIZED_SIZE,
+                available: buf.len(),
+            });
+        }
+
+        let vector_dim = u16::from_le_bytes([buf[0], buf[1]]);
+        let bits_per_coord = buf[2];
+        let reserved = buf[3];
+        let seed = u64::from_le_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+        ]);
+
+        if reserved != 0 {
+            return Err(CompressorError::InvalidPolarQuantConfig(format!(
+                "reserved byte must be 0, got {}",
+                reserved
+            )));
+        }
+
+        crate::preprocessor::polar_quant::PolarQuantConfig::new(vector_dim, bits_per_coord, seed)?;
+        Ok(Self {
+            vector_dim,
+            bits_per_coord,
+            seed,
+        })
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -752,6 +888,7 @@ mod tests {
             has_content_checksum: true,
             has_repcodes: true,
             has_seek_table: true,
+            has_polar_quant_params: false,
         };
         let bits = flags.to_u16();
         let decoded = FrameFlags::from_u16(bits).unwrap();
@@ -777,6 +914,8 @@ mod tests {
             DataType::Float32Shuffle,
             DataType::Float64ShuffleDelta,
             DataType::Float32ShuffleDelta,
+            DataType::Float64PolarQuant,
+            DataType::Float32PolarQuant,
         ];
         let parser_modes = [ParserMode::Greedy, ParserMode::Lazy, ParserMode::Optimal];
 
@@ -791,6 +930,7 @@ mod tests {
                                 has_content_checksum: ck,
                                 has_repcodes: rc,
                                 has_seek_table: st,
+                                has_polar_quant_params: false,
                             };
                             let bits = flags.to_u16();
                             let decoded = FrameFlags::from_u16(bits).unwrap();
@@ -808,19 +948,23 @@ mod tests {
 
     #[test]
     fn frame_flags_rejects_unknown_high_bits() {
-        // Valid flags with bit 11 set — should be rejected
+        // Valid flags with bit 11 clear.
         let valid_base = FrameFlags {
             data_type: DataType::Raw,
             parser_mode: ParserMode::Greedy,
             has_content_checksum: false,
             has_repcodes: false,
             has_seek_table: false,
+            has_polar_quant_params: false,
         };
         let bits = valid_base.to_u16();
         assert!(FrameFlags::from_u16(bits).is_ok());
 
-        // Set each reserved bit (11-15) and verify rejection
-        for bit in 11..=15 {
+        // Bit 11 is now used for PolarQuantParams.
+        assert!(FrameFlags::from_u16(bits | (1 << 11)).is_ok());
+
+        // Set each reserved bit (12-15) and verify rejection.
+        for bit in 12..=15 {
             let bad_bits = bits | (1 << bit);
             assert!(
                 FrameFlags::from_u16(bad_bits).is_err(),
@@ -840,6 +984,7 @@ mod tests {
                 has_content_checksum: true,
                 has_repcodes: true,
                 has_seek_table: true,
+                has_polar_quant_params: false,
             },
             block_size: DEFAULT_BLOCK_SIZE as u32,
             original_size: 123_456_789,
@@ -862,6 +1007,7 @@ mod tests {
                 has_content_checksum: false,
                 has_repcodes: true,
                 has_seek_table: false,
+                has_polar_quant_params: false,
             },
             block_size: 1024,
             original_size: 0,
@@ -903,14 +1049,28 @@ mod tests {
         let fast = CompressionConfig::fast();
         assert_eq!(fast.parser_mode, ParserMode::Greedy);
         assert_eq!(fast.max_chain_depth, 8);
+        assert!(fast.lossy.is_none());
 
         let balanced = CompressionConfig::balanced();
         assert_eq!(balanced.parser_mode, ParserMode::Lazy);
         assert_eq!(balanced.max_chain_depth, 64);
+        assert!(balanced.lossy.is_none());
 
         let max = CompressionConfig::max_compression();
         assert_eq!(max.parser_mode, ParserMode::Optimal);
         assert_eq!(max.max_chain_depth, 256);
+        assert!(max.lossy.is_none());
+    }
+
+    #[test]
+    fn compression_config_lossy_constructor() {
+        let cfg = CompressionConfig::lossy(8);
+        let lossy = cfg.lossy.expect("lossy config");
+        assert_eq!(
+            lossy.vector_dim,
+            crate::preprocessor::polar_quant::POLAR_QUANT_DEFAULT_DIM
+        );
+        assert_eq!(lossy.bits_per_coord, 8);
     }
 
     #[test]
@@ -931,6 +1091,9 @@ mod tests {
         assert!(DataType::Float32Shuffle.uses_shuffle());
         assert!(!DataType::Float64.uses_shuffle());
         assert!(!DataType::Raw.uses_shuffle());
+        assert!(DataType::Float64PolarQuant.uses_polar_quant());
+        assert!(DataType::Float32PolarQuant.uses_polar_quant());
+        assert!(!DataType::Float64.uses_polar_quant());
 
         assert_eq!(DataType::IntegerI64.element_size(), 8);
         assert_eq!(DataType::IntegerI32.element_size(), 4);
@@ -938,6 +1101,8 @@ mod tests {
         assert_eq!(DataType::Float32.element_size(), 4);
         assert_eq!(DataType::Float64Shuffle.element_size(), 8);
         assert_eq!(DataType::Float32Shuffle.element_size(), 4);
+        assert_eq!(DataType::Float64PolarQuant.element_size(), 8);
+        assert_eq!(DataType::Float32PolarQuant.element_size(), 4);
         assert_eq!(DataType::Raw.element_size(), 1);
     }
 
@@ -971,6 +1136,19 @@ mod tests {
     }
 
     #[test]
+    fn polar_quant_params_roundtrip() {
+        let params = PolarQuantParams {
+            vector_dim: 256,
+            bits_per_coord: 8,
+            seed: 0xC0FFEE_FEEDFACE,
+        };
+        let bytes = params.to_bytes();
+        assert_eq!(bytes.len(), PolarQuantParams::SERIALIZED_SIZE);
+        let decoded = PolarQuantParams::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, params);
+    }
+
+    #[test]
     fn frame_flags_bit10_seek_table() {
         let flags_on = FrameFlags {
             data_type: DataType::Raw,
@@ -978,12 +1156,14 @@ mod tests {
             has_content_checksum: false,
             has_repcodes: false,
             has_seek_table: true,
+            has_polar_quant_params: false,
         };
         let bits = flags_on.to_u16();
         assert_eq!((bits >> 10) & 1, 1);
 
         let flags_off = FrameFlags {
             has_seek_table: false,
+            has_polar_quant_params: false,
             ..flags_on
         };
         let bits = flags_off.to_u16();

@@ -24,11 +24,11 @@ use std::sync::Arc;
 
 use crate::entropy;
 use crate::parser;
-use crate::preprocessor::{self, stride as stride_transform, PreprocessorConfig};
+use crate::preprocessor::{self, polar_quant, stride as stride_transform, PreprocessorConfig};
 use crate::workspace::{DecodeWorkspace, EncodeWorkspace, PreprocessedDataRef};
 use crate::{
-    BlockHeader, CompressionConfig, CompressorError, DataType, FrameFlags, FrameHeader, Result,
-    SeekTable, FRAME_VERSION,
+    BlockHeader, CompressionConfig, CompressorError, DataType, FrameFlags, FrameHeader,
+    PolarQuantParams, Result, SeekTable, FRAME_VERSION,
 };
 
 use crc32fast::Hasher as CrcHasher;
@@ -46,6 +46,109 @@ struct CompressedBlock {
     payload: Vec<u8>,
 }
 
+#[inline]
+fn bytes_to_f64_vec(chunk: &[u8]) -> Vec<f64> {
+    chunk
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+#[inline]
+fn bytes_to_f32_vec(chunk: &[u8]) -> Vec<f32> {
+    chunk
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Compress a single byte substream (preprocess → parse → entropy).
+fn compress_substream(
+    input: &[u8],
+    data_type: DataType,
+    stride_val: usize,
+    config: &CompressionConfig,
+    ws: &mut EncodeWorkspace,
+) -> Result<Vec<u8>> {
+    let preprocess_input = if stride_val > 0 {
+        stride_transform::transpose_into(input, stride_val, &mut ws.stride_buf);
+        &ws.stride_buf[..]
+    } else {
+        input
+    };
+
+    let pp_config = PreprocessorConfig {
+        data_type: Some(data_type),
+        double_delta: true,
+    };
+    preprocessor::preprocess_into(preprocess_input, &pp_config, &mut ws.preprocess)?;
+    parser::parse_into(&ws.preprocess.output, config, &mut ws.parser)?;
+    let (payload, _cost_model) = entropy::encode_tokens_into(&ws.parser.tokens, &mut ws.entropy)?;
+    Ok(payload)
+}
+
+fn compress_polar_quant_block(
+    chunk: &[u8],
+    config: &CompressionConfig,
+    data_type: DataType,
+    ws: &mut EncodeWorkspace,
+) -> Result<CompressedBlock> {
+    let lossy = config
+        .lossy
+        .ok_or(CompressorError::LossyRequiresFloatType)?;
+    let pq_cfg =
+        polar_quant::PolarQuantConfig::new(lossy.vector_dim, lossy.bits_per_coord, lossy.seed)?;
+
+    match data_type {
+        DataType::Float64PolarQuant => {
+            let values = bytes_to_f64_vec(chunk);
+            polar_quant::encode_f64_into(&values, pq_cfg, &mut ws.polar_quant)?;
+        }
+        DataType::Float32PolarQuant => {
+            let values = bytes_to_f32_vec(chunk);
+            polar_quant::encode_f32_into(&values, pq_cfg, &mut ws.polar_quant)?;
+        }
+        _ => unreachable!("non-polar data type in compress_polar_quant_block"),
+    }
+
+    let codes_stride = (lossy.vector_dim as usize * lossy.bits_per_coord as usize) / 8;
+
+    // Move substreams out of workspace while running compression so we can
+    // mutably borrow the workspace scratch without self-borrow conflicts.
+    let codes_stream = std::mem::take(&mut ws.polar_quant.codes);
+    let means_stream = std::mem::take(&mut ws.polar_quant.means);
+    let scales_stream = std::mem::take(&mut ws.polar_quant.scales);
+
+    let codes_payload = compress_substream(&codes_stream, DataType::Raw, codes_stride, config, ws)?;
+    let means_payload = compress_substream(&means_stream, DataType::Float32, 0, config, ws)?;
+    let scales_payload = compress_substream(&scales_stream, DataType::Float32, 0, config, ws)?;
+
+    ws.polar_quant.codes = codes_stream;
+    ws.polar_quant.means = means_stream;
+    ws.polar_quant.scales = scales_stream;
+
+    let mut payload =
+        Vec::with_capacity(8 + codes_payload.len() + means_payload.len() + scales_payload.len());
+    payload.extend_from_slice(&(codes_payload.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&(means_payload.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&codes_payload);
+    payload.extend_from_slice(&means_payload);
+    payload.extend_from_slice(&scales_payload);
+
+    let mut hasher = CrcHasher::new();
+    hasher.update(&payload);
+    let crc32 = hasher.finalize();
+
+    Ok(CompressedBlock {
+        header: BlockHeader {
+            compressed_size: payload.len() as u32,
+            original_size: chunk.len() as u32,
+            crc32,
+        },
+        payload,
+    })
+}
+
 /// Compress a single chunk through the full pipeline using an explicit workspace.
 ///
 /// Pipeline: stride transpose → preprocess → LZ77 parse → entropy encode → CRC32.
@@ -56,35 +159,12 @@ fn compress_one_block(
     stride_val: usize,
     ws: &mut EncodeWorkspace,
 ) -> Result<CompressedBlock> {
-    let EncodeWorkspace {
-        ref mut preprocess,
-        ref mut parser,
-        ref mut entropy,
-        ref mut stride_buf,
-    } = *ws;
+    if data_type.uses_polar_quant() {
+        return compress_polar_quant_block(chunk, config, data_type, ws);
+    }
 
-    // 0. Stride transposition (if configured) — cache-aware tiled transpose
-    let preprocess_input = if stride_val > 0 {
-        stride_transform::transpose_into(chunk, stride_val, stride_buf);
-        &stride_buf[..]
-    } else {
-        chunk
-    };
+    let payload = compress_substream(chunk, data_type, stride_val, config, ws)?;
 
-    // 1. Preprocess — data lands in preprocess.output
-    let pp_config = PreprocessorConfig {
-        data_type: Some(data_type),
-        double_delta: true,
-    };
-    preprocessor::preprocess_into(preprocess_input, &pp_config, preprocess)?;
-
-    // 2. LZ77 Parse — tokens land in parser.tokens
-    parser::parse_into(&preprocess.output, config, parser)?;
-
-    // 3. Entropy Encode — only the payload Vec<u8> is a fresh allocation
-    let (payload, _cost_model) = entropy::encode_tokens_into(&parser.tokens, entropy)?;
-
-    // 4. CRC32 of compressed payload
     let mut hasher = CrcHasher::new();
     hasher.update(&payload);
     let crc32 = hasher.finalize();
@@ -110,10 +190,45 @@ pub fn compress(data: &[u8], config: &CompressionConfig) -> Result<Vec<u8>> {
         return Err(CompressorError::EmptyInput);
     }
 
+    if let Some(_lossy) = &config.lossy {
+        match config.data_type {
+            Some(DataType::Float64PolarQuant) | Some(DataType::Float32PolarQuant) => {}
+            _ => return Err(CompressorError::LossyRequiresFloatType),
+        }
+    }
+    match config.data_type {
+        Some(DataType::Float64PolarQuant) | Some(DataType::Float32PolarQuant) => {
+            if config.lossy.is_none() {
+                return Err(CompressorError::LossyRequiresFloatType);
+            }
+            if config.stride.is_some() {
+                return Err(CompressorError::Preprocessor(
+                    "stride transposition is not compatible with PolarQuant".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+
     // Determine data type: explicit → auto-detect → Raw
     let data_type = match config.data_type {
         Some(dt) => dt,
         None => preprocessor::auto_detect(data),
+    };
+
+    let polar_params = if data_type.uses_polar_quant() {
+        let lossy = config
+            .lossy
+            .ok_or(CompressorError::LossyRequiresFloatType)?;
+        let _ =
+            polar_quant::PolarQuantConfig::new(lossy.vector_dim, lossy.bits_per_coord, lossy.seed)?;
+        Some(PolarQuantParams {
+            vector_dim: lossy.vector_dim,
+            bits_per_coord: lossy.bits_per_coord,
+            seed: lossy.seed,
+        })
+    } else {
+        None
     };
 
     let elem_size = data_type.element_size();
@@ -219,6 +334,7 @@ pub fn compress(data: &[u8], config: &CompressionConfig) -> Result<Vec<u8>> {
         has_content_checksum: config.store_checksum,
         has_repcodes: true,
         has_seek_table: config.store_seek_table,
+        has_polar_quant_params: polar_params.is_some(),
     };
     let frame_header = FrameHeader {
         version: FRAME_VERSION,
@@ -232,10 +348,19 @@ pub fn compress(data: &[u8], config: &CompressionConfig) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     output.extend_from_slice(&frame_header.to_bytes());
 
+    if let Some(params) = polar_params {
+        output.extend_from_slice(&params.to_bytes());
+    }
+
     // Write seek table if configured
     if config.store_seek_table {
         let st_size = SeekTable::serialized_size(block_count as u32);
-        let mut cursor = (FrameHeader::SERIALIZED_SIZE + st_size) as u64;
+        let pq_size = if polar_params.is_some() {
+            PolarQuantParams::SERIALIZED_SIZE
+        } else {
+            0
+        };
+        let mut cursor = (FrameHeader::SERIALIZED_SIZE + pq_size + st_size) as u64;
         let mut entries = Vec::with_capacity(block_count);
         for block in &blocks {
             entries.push(cursor);
@@ -254,12 +379,147 @@ pub fn compress(data: &[u8], config: &CompressionConfig) -> Result<Vec<u8>> {
     // Optional SHA-256 content checksum over original data
     if config.store_checksum {
         let mut hasher = Sha256::new();
-        hasher.update(data);
+        if config.lossy.is_some() {
+            let mut trial = output.clone();
+            let mut bits = u16::from_le_bytes([trial[5], trial[6]]);
+            bits &= !(1 << 8);
+            trial[5..7].copy_from_slice(&bits.to_le_bytes());
+            let reconstructed = decompress(&trial)?;
+            hasher.update(&reconstructed);
+        } else {
+            hasher.update(data);
+        }
         let digest = hasher.finalize();
         output.extend_from_slice(&digest);
     }
 
     Ok(output)
+}
+
+fn decode_polar_quant_block(
+    payload: &[u8],
+    bh: &BlockHeader,
+    data_type: DataType,
+    params: PolarQuantParams,
+    ws: &mut DecodeWorkspace,
+) -> Result<Vec<u8>> {
+    if payload.len() < 8 {
+        return Err(CompressorError::CorruptedBlock {
+            offset: 0,
+            detail: "polar-quant payload too short for stream prefixes".into(),
+        });
+    }
+
+    let codes_size = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let means_size = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    if 8 + codes_size + means_size > payload.len() {
+        return Err(CompressorError::CorruptedBlock {
+            offset: 0,
+            detail: "polar-quant payload stream sizes exceed block payload length".into(),
+        });
+    }
+
+    let codes_payload = &payload[8..8 + codes_size];
+    let means_payload = &payload[8 + codes_size..8 + codes_size + means_size];
+    let scales_payload = &payload[8 + codes_size + means_size..];
+
+    let elem_size = data_type.element_size();
+    if bh.original_size as usize % elem_size != 0 {
+        return Err(CompressorError::DataTypeMismatch {
+            element_size: elem_size,
+            buffer_len: bh.original_size as usize,
+        });
+    }
+
+    let pq_cfg =
+        polar_quant::PolarQuantConfig::new(params.vector_dim, params.bits_per_coord, params.seed)?;
+    let dim = pq_cfg.vector_dim as usize;
+    let element_count = bh.original_size as usize / elem_size;
+    if element_count % dim != 0 {
+        return Err(CompressorError::DataTypeMismatch {
+            element_size: dim,
+            buffer_len: element_count,
+        });
+    }
+    let vector_count = element_count / dim;
+    let aux_bytes = vector_count * 4;
+    let codes_bytes = (vector_count * dim * pq_cfg.bits_per_coord as usize).div_ceil(8);
+    let codes_stride = (pq_cfg.vector_dim as usize * pq_cfg.bits_per_coord as usize) / 8;
+
+    let mut crc = CrcHasher::new();
+    crc.update(codes_payload);
+    let codes_block = BlockHeader {
+        compressed_size: codes_payload.len() as u32,
+        original_size: codes_bytes as u32,
+        crc32: crc.finalize(),
+    };
+    ws.polar_quant.codes = decode_block_payload(
+        codes_payload,
+        &codes_block,
+        DataType::Raw,
+        codes_stride,
+        None,
+        ws,
+    )?;
+
+    let mut crc = CrcHasher::new();
+    crc.update(means_payload);
+    let means_block = BlockHeader {
+        compressed_size: means_payload.len() as u32,
+        original_size: aux_bytes as u32,
+        crc32: crc.finalize(),
+    };
+    ws.polar_quant.means =
+        decode_block_payload(means_payload, &means_block, DataType::Float32, 0, None, ws)?;
+
+    let mut crc = CrcHasher::new();
+    crc.update(scales_payload);
+    let scales_block = BlockHeader {
+        compressed_size: scales_payload.len() as u32,
+        original_size: aux_bytes as u32,
+        crc32: crc.finalize(),
+    };
+    ws.polar_quant.scales = decode_block_payload(
+        scales_payload,
+        &scales_block,
+        DataType::Float32,
+        0,
+        None,
+        ws,
+    )?;
+
+    let codes = ws.polar_quant.codes.clone();
+    let means = ws.polar_quant.means.clone();
+    let scales = ws.polar_quant.scales.clone();
+    let enc_ref = polar_quant::PolarQuantEncodedRef {
+        codes: &codes,
+        means: &means,
+        scales: &scales,
+        vector_count: vector_count as u32,
+    };
+
+    let mut out = Vec::new();
+    match data_type {
+        DataType::Float64PolarQuant => {
+            polar_quant::decode_f64_into(&enc_ref, pq_cfg, &mut out, &mut ws.polar_quant)?;
+        }
+        DataType::Float32PolarQuant => {
+            polar_quant::decode_f32_into(&enc_ref, pq_cfg, &mut out, &mut ws.polar_quant)?;
+        }
+        _ => unreachable!("decode_polar_quant_block called for non-polar type"),
+    }
+
+    if out.len() != bh.original_size as usize {
+        return Err(CompressorError::CorruptedBlock {
+            offset: 0,
+            detail: format!(
+                "polar-quant decode size mismatch: expected {} bytes, got {} bytes",
+                bh.original_size,
+                out.len()
+            ),
+        });
+    }
+    Ok(out)
 }
 
 /// Decode a single compressed block payload into its original bytes.
@@ -271,6 +531,7 @@ pub(crate) fn decode_block_payload(
     bh: &BlockHeader,
     data_type: DataType,
     stride_val: usize,
+    polar_params: Option<PolarQuantParams>,
     ws: &mut DecodeWorkspace,
 ) -> Result<Vec<u8>> {
     // Verify CRC32
@@ -284,12 +545,22 @@ pub(crate) fn decode_block_payload(
         });
     }
 
+    if data_type.uses_polar_quant() {
+        let params = polar_params.ok_or_else(|| {
+            CompressorError::InvalidPolarQuantConfig(
+                "missing PolarQuantParams for polar-quant block".into(),
+            )
+        })?;
+        return decode_polar_quant_block(payload, bh, data_type, params, ws);
+    }
+
     // Destructure workspace for split borrows
     let DecodeWorkspace {
         entropy: ref mut entropy_scratch,
         ref mut replay,
         ref mut preprocess,
         ref mut stride_buf,
+        ..
     } = *ws;
 
     // Entropy decode -> tokens left in entropy_scratch.tokens
@@ -353,6 +624,26 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let data_type = frame_header.flags.data_type;
     let stride_val = frame_header.stride as usize;
     let mut pos = FrameHeader::SERIALIZED_SIZE;
+    let mut polar_params = None;
+
+    if frame_header.flags.has_polar_quant_params {
+        if pos + PolarQuantParams::SERIALIZED_SIZE > data.len() {
+            return Err(CompressorError::BufferUnderflow {
+                needed: PolarQuantParams::SERIALIZED_SIZE,
+                available: data.len() - pos,
+            });
+        }
+        let params =
+            PolarQuantParams::from_bytes(&data[pos..pos + PolarQuantParams::SERIALIZED_SIZE])?;
+        polar_params = Some(params);
+        pos += PolarQuantParams::SERIALIZED_SIZE;
+    }
+
+    if data_type.uses_polar_quant() && polar_params.is_none() {
+        return Err(CompressorError::InvalidPolarQuantConfig(
+            "polar-quant data_type requires PolarQuantParams".into(),
+        ));
+    }
 
     // Skip and verify seek table if present
     if frame_header.flags.has_seek_table {
@@ -416,7 +707,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
             DECODE_WS.with(|cell| {
                 let mut ws = cell.borrow_mut();
                 let payload = &data[*payload_start..*payload_start + bh.compressed_size as usize];
-                decode_block_payload(payload, bh, data_type, stride_val, &mut ws)
+                decode_block_payload(payload, bh, data_type, stride_val, polar_params, &mut ws)
             })
         };
         if block_infos.len() > 1 {
@@ -433,7 +724,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
             .iter()
             .map(|(bh, payload_start)| {
                 let payload = &data[*payload_start..*payload_start + bh.compressed_size as usize];
-                decode_block_payload(payload, bh, data_type, stride_val, &mut ws)
+                decode_block_payload(payload, bh, data_type, stride_val, polar_params, &mut ws)
             })
             .collect()
     };
@@ -473,6 +764,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seekable::SeekableReader;
     use crate::{CompressionConfig, DataType, ParserMode};
 
     #[test]
@@ -877,11 +1169,122 @@ mod tests {
                 &bh,
                 frame.flags.data_type,
                 frame.stride as usize,
+                None,
                 &mut ws,
             )
             .unwrap();
             manual_result.extend_from_slice(&block);
         }
         assert_eq!(full_result, manual_result);
+    }
+
+    fn mean_max_rel_err_f64(original: &[u8], decoded: &[u8]) -> (f64, f64) {
+        let mut sum = 0.0f64;
+        let mut max = 0.0f64;
+        let mut n = 0usize;
+        for (a, b) in original.chunks_exact(8).zip(decoded.chunks_exact(8)) {
+            let av = f64::from_le_bytes(a.try_into().unwrap());
+            let bv = f64::from_le_bytes(b.try_into().unwrap());
+            let rel = (av - bv).abs() / av.abs().max(1.0);
+            sum += rel;
+            max = max.max(rel);
+            n += 1;
+        }
+        (sum / n as f64, max)
+    }
+
+    fn mean_max_rel_err_f32(original: &[u8], decoded: &[u8]) -> (f64, f64) {
+        let mut sum = 0.0f64;
+        let mut max = 0.0f64;
+        let mut n = 0usize;
+        for (a, b) in original.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+            let av = f32::from_le_bytes(a.try_into().unwrap()) as f64;
+            let bv = f32::from_le_bytes(b.try_into().unwrap()) as f64;
+            let rel = (av - bv).abs() / av.abs().max(1.0);
+            sum += rel;
+            max = max.max(rel);
+            n += 1;
+        }
+        (sum / n as f64, max)
+    }
+
+    #[test]
+    fn roundtrip_f64_polar_quant_8bit() {
+        let data = crate::harness::generate_temperatures(102_400);
+        let mut config = CompressionConfig::lossy(8);
+        config.data_type = Some(DataType::Float64PolarQuant);
+        config.store_checksum = true;
+        config.block_size = 64 * 1024;
+        let compressed = compress(&data, &config).unwrap();
+        let decoded = decompress(&compressed).unwrap();
+        assert_eq!(decoded.len(), data.len());
+        let (mean_rel, max_rel) = mean_max_rel_err_f64(&data, &decoded);
+        assert!(mean_rel < 0.005, "mean_rel={}", mean_rel);
+        assert!(max_rel < 0.01, "max_rel={}", max_rel);
+    }
+
+    #[test]
+    fn roundtrip_f32_polar_quant_8bit() {
+        let data = crate::harness::generate_vibration(102_400);
+        let mut config = CompressionConfig::lossy(8);
+        config.data_type = Some(DataType::Float32PolarQuant);
+        config.store_checksum = true;
+        config.block_size = 64 * 1024;
+        let compressed = compress(&data, &config).unwrap();
+        let decoded = decompress(&compressed).unwrap();
+        assert_eq!(decoded.len(), data.len());
+        let (mean_rel, max_rel) = mean_max_rel_err_f32(&data, &decoded);
+        assert!(mean_rel < 0.02, "mean_rel={}", mean_rel);
+        assert!(max_rel < 0.10, "max_rel={}", max_rel);
+    }
+
+    #[test]
+    fn roundtrip_f64_polar_quant_4bit() {
+        let data = crate::harness::generate_temperatures(102_400);
+        let mut config = CompressionConfig::lossy(4);
+        config.data_type = Some(DataType::Float64PolarQuant);
+        config.store_checksum = true;
+        config.block_size = 64 * 1024;
+        let compressed = compress(&data, &config).unwrap();
+        let decoded = decompress(&compressed).unwrap();
+        let (mean_rel, max_rel) = mean_max_rel_err_f64(&data, &decoded);
+        assert!(mean_rel < 0.03, "mean_rel={}", mean_rel);
+        assert!(max_rel < 0.12, "max_rel={}", max_rel);
+    }
+
+    #[test]
+    fn polar_quant_seekable_random_access() {
+        let data = crate::harness::generate_temperatures(102_400);
+        let mut config = CompressionConfig::lossy(8);
+        config.data_type = Some(DataType::Float64PolarQuant);
+        config.store_seek_table = true;
+        config.block_size = 64 * 1024;
+        let compressed = compress(&data, &config).unwrap();
+
+        let full = decompress(&compressed).unwrap();
+        let mut reader = SeekableReader::new(&compressed).unwrap();
+        let block = reader.decompress_block(3).unwrap();
+        let start = (reader.header().block_size as usize) * 3;
+        let end = start + block.len();
+        assert_eq!(block, full[start..end]);
+    }
+
+    #[test]
+    fn lossy_requires_float_type_error() {
+        let data = crate::harness::generate_timestamps(10_000);
+        let mut config = CompressionConfig::lossy(8);
+        config.data_type = Some(DataType::IntegerI64);
+        let err = compress(&data, &config).unwrap_err();
+        assert!(matches!(err, CompressorError::LossyRequiresFloatType));
+    }
+
+    #[test]
+    fn polar_quant_stride_rejected() {
+        let data = crate::harness::generate_temperatures(10_000);
+        let mut config = CompressionConfig::lossy(8);
+        config.data_type = Some(DataType::Float64PolarQuant);
+        config.stride = Some(8);
+        let err = compress(&data, &config).unwrap_err();
+        assert!(matches!(err, CompressorError::Preprocessor(_)));
     }
 }

@@ -9,26 +9,32 @@ Data flows through six stages. Each stage is optional and independently testable
 ```
 Input bytes
   → Stride Transpose (AoS → SoA, if stride > 0)
-  → Preprocessor (delta-of-delta, Gorilla XOR, or shuffle+delta)
+  → Preprocessor (delta-of-delta, Gorilla XOR, shuffle+delta, or PolarQuant lossy mode)
   → Match Finder (hash chain + SIMD extension)
   → Parser (greedy, lazy, or optimal DP)
   → Entropy Coder (FSE/ANS, 3 sub-streams)
   → Frame Assembly (headers, seek table, checksums)
 ```
 
-Decompression reverses the pipeline: FSE decode → LZ77 replay → inverse preprocess → inverse transpose.
+Decompression reverses the pipeline: FSE decode → LZ77 replay → inverse preprocess (or PolarQuant inverse path) → inverse transpose.
 
 ## Frame Format
 
 ```
 [FrameHeader — 25 bytes]
   magic:          "IOTC" (4 bytes)
-  version:        u8
-  flags:          u16 (data type 4 bits, parser 2 bits, checksum/repcode/seek bits)
+  version:        u8 (current: 2, reads v1 and v2)
+  flags:          u16 (data type, parser, checksum, repcode, seek, polar-params bits)
   block_size:     u32
   original_size:  u64
   block_count:    u32
   stride:         u16 (0 = no transposition)
+
+[PolarQuantParams — 12 bytes, optional]
+  vector_dim:     u16
+  bits_per_coord: u8
+  reserved:       u8
+  seed:           u64
 
 [SeekTable — 8*N+4 bytes, optional]
   entries:        u64 x block_count (absolute byte offsets to each BlockHeader)
@@ -36,7 +42,9 @@ Decompression reverses the pipeline: FSE decode → LZ77 replay → inverse prep
 
 [Block 0..N]
   BlockHeader:    12 bytes (compressed_size: u32, original_size: u32, crc32: u32)
-  Payload:        variable (FSE-encoded LZ77 token stream)
+  Payload:        variable
+                  - lossless types: FSE-encoded LZ77 token stream
+                  - polar-quant types: [codes_size u32][means_size u32][codes][means][scales]
 
 [SHA-256 — 32 bytes, optional]
 ```
@@ -89,6 +97,16 @@ The adaptive float strategy, selected by auto-detect when it outperforms Gorilla
 Exponent bytes (which change slowly even in noisy data) form a near-constant lane that compresses well. Mantissa bytes remain chaotic but the exponent lane savings outweigh the overhead.
 
 The shuffle operation is **L1-cache tiled**: large blocks are processed in tiles that fit in L1 to avoid cache thrashing.
+
+### PolarQuant (lossy floats)
+
+PolarQuant is an explicit lossy mode for float data (`f64pq`, `f32pq`):
+1. Mean-center each vector (`dim`, power-of-two; default 256)
+2. Apply HD3 rotation (three Hadamard/sign rounds)
+3. Uniformly quantize to `k` bits (`2..=8`)
+4. Emit three sub-streams: packed codes, per-vector means, per-vector scales
+
+The three streams are still fed through the existing LZ77+FSE stages, but use a specialized per-block payload layout. This mode is intentionally opt-in and never selected by auto-detect.
 
 ## Match Finder
 
@@ -176,7 +194,8 @@ Supported column types: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f
 ## Python Bindings
 
 `python.rs` (feature-gated) provides PyO3 bindings:
-- `iotc.compress()` / `iotc.decompress()` — stateless functions
+- `iotc.compress()` / `iotc.decompress()` — stateless lossless functions
+- `iotc.compress_lossy()` — explicit PolarQuant entry point
 - `iotc.SeekableReader` — wraps the Rust `SeekableReader` with Python-friendly API
 - `reader.extract_columns(schema_dict)` — returns `dict[str, bytes]` for NumPy/Polars ingest
 

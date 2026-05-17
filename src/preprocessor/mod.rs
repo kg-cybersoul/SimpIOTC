@@ -21,6 +21,7 @@ pub mod byte_delta;
 pub mod delta;
 pub mod entropy_probe;
 pub mod gorilla_xor;
+pub mod polar_quant;
 pub mod stride;
 
 use crate::{CompressorError, DataType, Result};
@@ -194,6 +195,12 @@ pub fn preprocess(data: &[u8], config: &PreprocessorConfig) -> Result<Preprocess
                 data: encoded,
             })
         }
+
+        DataType::Float64PolarQuant | DataType::Float32PolarQuant => {
+            Err(CompressorError::Preprocessor(
+                "PolarQuant must use the lossy block pipeline path".into(),
+            ))
+        }
     }
 }
 
@@ -362,6 +369,12 @@ pub fn preprocess_into<'a>(
                 data: &scratch.output,
             })
         }
+
+        DataType::Float64PolarQuant | DataType::Float32PolarQuant => {
+            Err(CompressorError::Preprocessor(
+                "PolarQuant must use the lossy block pipeline path".into(),
+            ))
+        }
     }
 }
 
@@ -419,6 +432,12 @@ pub fn depreprocess(preprocessed: &PreprocessedData) -> Result<Vec<u8>> {
             let undelta = byte_delta::decode(&preprocessed.data);
             Ok(bitshuffle::unshuffle(&undelta, 4))
         }
+
+        DataType::Float64PolarQuant | DataType::Float32PolarQuant => {
+            Err(CompressorError::Preprocessor(
+                "PolarQuant must use the lossy block pipeline path".into(),
+            ))
+        }
     }
 }
 
@@ -474,6 +493,12 @@ pub fn depreprocess_into(
             scratch.output.clear();
             scratch.output = bitshuffle::unshuffle(&undelta, 4);
             Ok(())
+        }
+
+        DataType::Float64PolarQuant | DataType::Float32PolarQuant => {
+            Err(CompressorError::Preprocessor(
+                "PolarQuant must use the lossy block pipeline path".into(),
+            ))
         }
     }
 }

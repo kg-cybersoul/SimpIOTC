@@ -1,7 +1,8 @@
 use clap::{Parser, ValueEnum};
 use iot_compressor::{
     parallel::{compress, decompress},
-    BlockHeader, CompressionConfig, DataType, FrameHeader, ParserMode, SeekTable,
+    BlockHeader, CompressionConfig, DataType, FrameHeader, LossyConfig, ParserMode,
+    PolarQuantParams, SeekTable,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -56,6 +57,19 @@ struct Args {
     #[arg(long)]
     no_seek_table: bool,
 
+    /// Enable PolarQuant lossy mode with N bits per coordinate (2-8).
+    /// Requires --data-type=f64pq or --data-type=f32pq.
+    #[arg(long, value_name = "N")]
+    lossy_bits: Option<u8>,
+
+    /// Vector dimension for PolarQuant (default 256, must be power of 2).
+    #[arg(long, value_name = "D", default_value_t = 256)]
+    lossy_dim: u16,
+
+    /// Seed for HD3 sign matrix generation (default 0xC0FFEE_FEEDFACE).
+    #[arg(long, value_name = "HEX")]
+    lossy_seed: Option<String>,
+
     /// Print frame info and exit (no output file needed)
     #[arg(long)]
     info: bool,
@@ -95,6 +109,10 @@ enum CliDataType {
     F64sd,
     /// f32 with byte shuffle + byte delta (best auto-detect choice for smooth floats)
     F32sd,
+    /// f64 lossy PolarQuant (HD3 + scalar quantization)
+    F64pq,
+    /// f32 lossy PolarQuant (HD3 + scalar quantization)
+    F32pq,
 }
 
 impl From<CliDataType> for DataType {
@@ -111,8 +129,20 @@ impl From<CliDataType> for DataType {
             CliDataType::F32s => DataType::Float32Shuffle,
             CliDataType::F64sd => DataType::Float64ShuffleDelta,
             CliDataType::F32sd => DataType::Float32ShuffleDelta,
+            CliDataType::F64pq => DataType::Float64PolarQuant,
+            CliDataType::F32pq => DataType::Float32PolarQuant,
         }
     }
+}
+
+fn parse_seed_hex(seed: &str) -> anyhow::Result<u64> {
+    let trimmed = seed.trim();
+    let raw = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u64::from_str_radix(raw, 16)
+        .map_err(|e| anyhow::anyhow!("invalid --lossy-seed '{}': {}", seed, e))
 }
 
 fn print_frame_info(data: &[u8]) -> anyhow::Result<()> {
@@ -125,7 +155,7 @@ fn print_frame_info(data: &[u8]) -> anyhow::Result<()> {
         header.version, header.original_size, header.block_count, header.block_size
     );
     println!(
-        "Flags: data_type={}, parser={}, checksum={}, repcodes={}, seek_table={}",
+        "Flags: data_type={}, parser={}, checksum={}, repcodes={}, seek_table={}, polar_params={}",
         flags.data_type,
         flags.parser_mode,
         if flags.has_content_checksum {
@@ -135,14 +165,39 @@ fn print_frame_info(data: &[u8]) -> anyhow::Result<()> {
         },
         if flags.has_repcodes { "yes" } else { "no" },
         if flags.has_seek_table { "yes" } else { "no" },
+        if flags.has_polar_quant_params {
+            "yes"
+        } else {
+            "no"
+        },
     );
     if header.stride > 0 {
         println!("Stride: {}", header.stride);
     }
 
+    let mut pos = FrameHeader::SERIALIZED_SIZE;
+    if flags.has_polar_quant_params {
+        if pos + PolarQuantParams::SERIALIZED_SIZE > data.len() {
+            println!(
+                "PolarQuant Params: TRUNCATED (need {} bytes, have {})",
+                PolarQuantParams::SERIALIZED_SIZE,
+                data.len() - pos
+            );
+            return Ok(());
+        }
+        let params =
+            PolarQuantParams::from_bytes(&data[pos..pos + PolarQuantParams::SERIALIZED_SIZE])
+                .map_err(|e| anyhow::anyhow!("PolarQuant params error: {:?}", e))?;
+        println!(
+            "PolarQuant: dim={}, bits={}, seed=0x{:X}",
+            params.vector_dim, params.bits_per_coord, params.seed
+        );
+        pos += PolarQuantParams::SERIALIZED_SIZE;
+    }
+
     if flags.has_seek_table {
         let st_size = SeekTable::serialized_size(header.block_count);
-        let st_start = FrameHeader::SERIALIZED_SIZE;
+        let st_start = pos;
         if st_start + st_size > data.len() {
             println!(
                 "Seek Table: TRUNCATED (need {} bytes, have {})",
@@ -213,7 +268,7 @@ fn main() -> anyhow::Result<()> {
             throughput
         );
     } else {
-        let config = CompressionConfig {
+        let mut config = CompressionConfig {
             parser_mode: args.parser.into(),
             data_type: args.data_type.map(|t| t.into()),
             num_threads: args.threads,
@@ -224,16 +279,47 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
 
+        if let Some(bits) = args.lossy_bits {
+            let data_type = config.data_type.ok_or_else(|| {
+                anyhow::anyhow!("--lossy-bits requires --data-type=f64pq or --data-type=f32pq")
+            })?;
+            match data_type {
+                DataType::Float64PolarQuant | DataType::Float32PolarQuant => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "--lossy-bits requires --data-type=f64pq or --data-type=f32pq"
+                    ));
+                }
+            }
+            let seed = match &args.lossy_seed {
+                Some(s) => parse_seed_hex(s)?,
+                None => iot_compressor::preprocessor::polar_quant::POLAR_QUANT_DEFAULT_SEED,
+            };
+            config.lossy = Some(LossyConfig {
+                vector_dim: args.lossy_dim,
+                bits_per_coord: bits,
+                seed,
+            });
+        }
+
         let stride_info = match config.stride {
             Some(s) => format!(", stride: {}", s),
             None => String::new(),
         };
+        let lossy_info = match config.lossy {
+            Some(lossy) => format!(
+                ", lossy: {} bits, dim {}, seed 0x{:X}",
+                lossy.bits_per_coord, lossy.vector_dim, lossy.seed
+            ),
+            None => String::new(),
+        };
         eprintln!(
-            "Compressing {} bytes (parser: {}, block_size: {}{})",
+            "Compressing {} bytes (parser: {}, block_size: {}{}{})",
             data.len(),
             config.parser_mode,
             config.block_size,
-            stride_info
+            stride_info,
+            lossy_info
         );
 
         let result =
