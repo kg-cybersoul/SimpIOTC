@@ -30,7 +30,7 @@ pub struct PolarQuantConfig {
 
 impl PolarQuantConfig {
     pub fn new(vector_dim: u16, bits_per_coord: u8, seed: u64) -> Result<Self> {
-        if vector_dim < 2 || vector_dim > POLAR_QUANT_MAX_DIM || !vector_dim.is_power_of_two() {
+        if !(2..=POLAR_QUANT_MAX_DIM).contains(&vector_dim) || !vector_dim.is_power_of_two() {
             return Err(CompressorError::PolarQuantDimNotPow2(vector_dim));
         }
         if !(POLAR_QUANT_MIN_BITS..=POLAR_QUANT_MAX_BITS).contains(&bits_per_coord) {
